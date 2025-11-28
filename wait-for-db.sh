@@ -1,20 +1,21 @@
 #!/bin/bash
+set -euo pipefail
 
 echo "Waiting for database to be ready..."
 
-# Wait for PostgreSQL to be ready
-until docker compose exec db pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-memory_db} > /dev/null 2>&1; do
+DB_USER=${POSTGRES_USER:-agi_user}
+DB_NAME=${POSTGRES_DB:-agi_db}
+
+# Run inside the container, so call postgres utilities directly (use the local socket)
+until pg_isready -U "${DB_USER}" -d "${DB_NAME}" > /dev/null 2>&1; do
     echo "Database is not ready yet, waiting..."
     sleep 2
 done
 
 echo "Database is ready!"
 
-# Optional: Run a test query to ensure extensions are loaded
 echo "Testing database connection and extensions..."
-docker compose exec db psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-memory_db} -c "SELECT 1;" > /dev/null 2>&1
-
-if [ $? -eq 0 ]; then
+if psql -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT 1;" > /dev/null 2>&1; then
     echo "Database is fully operational!"
 else
     echo "Database connection test failed"

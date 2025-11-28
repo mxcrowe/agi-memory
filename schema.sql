@@ -4,6 +4,7 @@ CREATE EXTENSION IF NOT EXISTS age;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS cube;
+CREATE EXTENSION IF NOT EXISTS http;
 
 -- Load AGE extension explicitly
 LOAD 'age';
@@ -295,6 +296,7 @@ DECLARE
     cluster_record RECORD;
     similarity_threshold FLOAT := 0.7;
     assigned_count INT := 0;
+    zero_vector vector(1536) := array_fill(0::float, ARRAY[1536])::vector;
 BEGIN
     -- Get memory details
     SELECT embedding, content INTO memory_embedding, memory_content
@@ -302,10 +304,15 @@ BEGIN
     
     -- Find similar clusters
     FOR cluster_record IN 
-        SELECT id, 1 - (centroid_embedding <=> memory_embedding) as similarity
-        FROM memory_clusters
-        WHERE centroid_embedding IS NOT NULL
-        ORDER BY centroid_embedding <=> memory_embedding
+        SELECT id, 1 - dist as similarity
+        FROM (
+            SELECT id, centroid_embedding <=> memory_embedding as dist
+            FROM memory_clusters
+            WHERE centroid_embedding IS NOT NULL
+              AND centroid_embedding <> zero_vector
+        ) distances
+        WHERE dist::text <> 'NaN'
+        ORDER BY dist
         LIMIT 10
     LOOP
         IF cluster_record.similarity >= similarity_threshold AND assigned_count < max_clusters THEN
@@ -410,3 +417,461 @@ JOIN cluster_activation_history mch ON mc.id = mch.cluster_id
 WHERE mch.activated_at > CURRENT_TIMESTAMP - INTERVAL '7 days'
 GROUP BY mc.id, mc.name, mc.emotional_signature, mc.keywords
 ORDER BY count(DISTINCT mch.id) DESC;
+
+-- Configuration table for embeddings service
+CREATE TABLE IF NOT EXISTS embedding_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Set default embeddings service URL (can be updated as needed)
+INSERT INTO embedding_config (key, value) 
+VALUES ('service_url', 'http://embeddings:80/embed')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+
+-- Embedding cache table for performance
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    content_hash TEXT PRIMARY KEY,
+    embedding vector(1536) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index for cache cleanup
+CREATE INDEX ON embedding_cache (created_at);
+
+-- Core function to get embeddings from the service
+CREATE OR REPLACE FUNCTION get_embedding(text_content TEXT) 
+RETURNS vector(1536) AS $$
+DECLARE
+    service_url TEXT;
+    response http_response;
+    request_body TEXT;
+    embedding_array FLOAT[];
+    embedding_json JSONB;
+    content_hash TEXT;
+    cached_embedding vector(1536);
+BEGIN
+    -- Generate hash for caching
+    content_hash := encode(sha256(text_content::bytea), 'hex');
+    
+    -- Check cache first
+    SELECT embedding INTO cached_embedding 
+    FROM embedding_cache 
+    WHERE content_hash = content_hash;
+    
+    IF FOUND THEN
+        RETURN cached_embedding;
+    END IF;
+    
+    -- Get service URL
+    SELECT value INTO service_url FROM embedding_config WHERE key = 'service_url';
+    
+    -- Prepare request body
+    request_body := json_build_object('inputs', text_content)::TEXT;
+    
+    -- Make HTTP request
+    SELECT * INTO response FROM http_post(
+        service_url,
+        request_body,
+        'application/json'
+    );
+    
+    -- Check response status
+    IF response.status != 200 THEN
+        RAISE EXCEPTION 'Embedding service error: % - %', response.status, response.content;
+    END IF;
+    
+    -- Parse response
+    embedding_json := response.content::JSONB;
+    
+    -- Extract embedding array (handle different response formats)
+    IF embedding_json ? 'embeddings' THEN
+        -- Format: {"embeddings": [[...numbers...]]}
+        embedding_array := ARRAY(
+            SELECT jsonb_array_elements_text((embedding_json->'embeddings')->0)::FLOAT
+        );
+    ELSIF embedding_json ? 'embedding' THEN
+        -- Format: {"embedding": [...numbers...]}
+        embedding_array := ARRAY(
+            SELECT jsonb_array_elements_text(embedding_json->'embedding')::FLOAT
+        );
+    ELSIF embedding_json ? 'data' THEN
+        -- Format: {"data": [{"embedding": [...numbers...]}]}
+        embedding_array := ARRAY(
+            SELECT jsonb_array_elements_text((embedding_json->'data')->0->'embedding')::FLOAT
+        );
+    ELSE
+        -- Direct array format: [...numbers...]
+        embedding_array := ARRAY(
+            SELECT jsonb_array_elements_text(embedding_json)::FLOAT
+        );
+    END IF;
+    
+    -- Validate embedding size
+    IF array_length(embedding_array, 1) != 1536 THEN
+        RAISE EXCEPTION 'Invalid embedding dimension: expected 1536, got %', array_length(embedding_array, 1);
+    END IF;
+    
+    -- Cache the result
+    INSERT INTO embedding_cache (content_hash, embedding)
+    VALUES (content_hash, embedding_array::vector(1536))
+    ON CONFLICT DO NOTHING;
+    
+    RETURN embedding_array::vector(1536);
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE EXCEPTION 'Failed to get embedding: %', SQLERRM;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Main function to create a memory with automatic embedding
+CREATE OR REPLACE FUNCTION create_memory(
+    p_type memory_type,
+    p_content TEXT,
+    p_importance FLOAT DEFAULT 0.5
+) RETURNS UUID AS $$
+DECLARE
+    memory_id UUID;
+    embedding_vec vector(1536);
+BEGIN
+    -- Generate embedding
+    embedding_vec := get_embedding(p_content);
+    
+    -- Insert memory
+    INSERT INTO memories (type, content, embedding, importance)
+    VALUES (p_type, p_content, embedding_vec, p_importance)
+    RETURNING id INTO memory_id;
+    
+    -- Assign to clusters
+    PERFORM assign_memory_to_clusters(memory_id);
+    
+    -- Create graph node
+    EXECUTE format(
+        'SELECT * FROM cypher(''memory_graph'', $q$
+            CREATE (n:MemoryNode {memory_id: %L, type: %L, created_at: %L})
+            RETURN n
+        $q$) as (result agtype)',
+        memory_id,
+        p_type,
+        CURRENT_TIMESTAMP
+    );
+    
+    RETURN memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create episodic memory with automatic embedding
+CREATE OR REPLACE FUNCTION create_episodic_memory(
+    p_content TEXT,
+    p_action_taken JSONB DEFAULT NULL,
+    p_context JSONB DEFAULT NULL,
+    p_result JSONB DEFAULT NULL,
+    p_emotional_valence FLOAT DEFAULT 0.0,
+    p_event_time TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    p_importance FLOAT DEFAULT 0.5
+) RETURNS UUID AS $$
+DECLARE
+    memory_id UUID;
+BEGIN
+    -- Create base memory
+    memory_id := create_memory('episodic', p_content, p_importance);
+    
+    -- Insert episodic details
+    INSERT INTO episodic_memories (
+        memory_id, action_taken, context, result, 
+        emotional_valence, event_time
+    ) VALUES (
+        memory_id, p_action_taken, p_context, p_result,
+        p_emotional_valence, p_event_time
+    );
+    
+    RETURN memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create semantic memory with automatic embedding
+CREATE OR REPLACE FUNCTION create_semantic_memory(
+    p_content TEXT,
+    p_confidence FLOAT,
+    p_category TEXT[] DEFAULT NULL,
+    p_related_concepts TEXT[] DEFAULT NULL,
+    p_source_references JSONB DEFAULT NULL,
+    p_importance FLOAT DEFAULT 0.5
+) RETURNS UUID AS $$
+DECLARE
+    memory_id UUID;
+BEGIN
+    -- Create base memory
+    memory_id := create_memory('semantic', p_content, p_importance);
+    
+    -- Insert semantic details
+    INSERT INTO semantic_memories (
+        memory_id, confidence, category, related_concepts,
+        source_references, last_validated
+    ) VALUES (
+        memory_id, p_confidence, p_category, p_related_concepts,
+        p_source_references, CURRENT_TIMESTAMP
+    );
+    
+    RETURN memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create procedural memory with automatic embedding
+CREATE OR REPLACE FUNCTION create_procedural_memory(
+    p_content TEXT,
+    p_steps JSONB,
+    p_prerequisites JSONB DEFAULT NULL,
+    p_importance FLOAT DEFAULT 0.5
+) RETURNS UUID AS $$
+DECLARE
+    memory_id UUID;
+BEGIN
+    -- Create base memory
+    memory_id := create_memory('procedural', p_content, p_importance);
+    
+    -- Insert procedural details
+    INSERT INTO procedural_memories (
+        memory_id, steps, prerequisites
+    ) VALUES (
+        memory_id, p_steps, p_prerequisites
+    );
+    
+    RETURN memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create strategic memory with automatic embedding
+CREATE OR REPLACE FUNCTION create_strategic_memory(
+    p_content TEXT,
+    p_pattern_description TEXT,
+    p_confidence_score FLOAT,
+    p_supporting_evidence JSONB DEFAULT NULL,
+    p_context_applicability JSONB DEFAULT NULL,
+    p_importance FLOAT DEFAULT 0.5
+) RETURNS UUID AS $$
+DECLARE
+    memory_id UUID;
+BEGIN
+    -- Create base memory
+    memory_id := create_memory('strategic', p_content, p_importance);
+    
+    -- Insert strategic details
+    INSERT INTO strategic_memories (
+        memory_id, pattern_description, confidence_score,
+        supporting_evidence, context_applicability
+    ) VALUES (
+        memory_id, p_pattern_description, p_confidence_score,
+        p_supporting_evidence, p_context_applicability
+    );
+    
+    RETURN memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to add memory to working memory with automatic embedding
+CREATE OR REPLACE FUNCTION add_to_working_memory(
+    p_content TEXT,
+    p_expiry INTERVAL DEFAULT INTERVAL '1 hour'
+) RETURNS UUID AS $$
+DECLARE
+    memory_id UUID;
+    embedding_vec vector(1536);
+BEGIN
+    -- Generate embedding
+    embedding_vec := get_embedding(p_content);
+    
+    -- Insert into working memory
+    INSERT INTO working_memory (content, embedding, expiry)
+    VALUES (p_content, embedding_vec, CURRENT_TIMESTAMP + p_expiry)
+    RETURNING id INTO memory_id;
+    
+    RETURN memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Search memories by semantic similarity (with automatic embedding)
+CREATE OR REPLACE FUNCTION search_similar_memories(
+    p_query_text TEXT,
+    p_limit INT DEFAULT 10,
+    p_memory_types memory_type[] DEFAULT NULL,
+    p_min_relevance FLOAT DEFAULT 0.0
+) RETURNS TABLE (
+    memory_id UUID,
+    content TEXT,
+    type memory_type,
+    similarity FLOAT,
+    relevance_score FLOAT,
+    importance FLOAT
+) AS $$
+DECLARE
+    query_embedding vector(1536);
+BEGIN
+    -- Generate embedding for query
+    query_embedding := get_embedding(p_query_text);
+    
+    -- Search memories
+    RETURN QUERY
+    SELECT 
+        m.id,
+        m.content,
+        m.type,
+        1 - (m.embedding <=> query_embedding) as similarity,
+        m.relevance_score,
+        m.importance
+    FROM memories m
+    WHERE m.status = 'active'
+    AND (p_memory_types IS NULL OR m.type = ANY(p_memory_types))
+    AND m.relevance_score >= p_min_relevance
+    ORDER BY m.embedding <=> query_embedding
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Find memories in working memory by similarity
+CREATE OR REPLACE FUNCTION search_working_memory(
+    p_query_text TEXT,
+    p_limit INT DEFAULT 5
+) RETURNS TABLE (
+    memory_id UUID,
+    content TEXT,
+    similarity FLOAT,
+    created_at TIMESTAMPTZ
+) AS $$
+DECLARE
+    query_embedding vector(1536);
+BEGIN
+    -- Generate embedding for query
+    query_embedding := get_embedding(p_query_text);
+    
+    -- Clean expired memories first
+    DELETE FROM working_memory WHERE expiry < CURRENT_TIMESTAMP;
+    
+    -- Search working memory
+    RETURN QUERY
+    SELECT 
+        wm.id,
+        wm.content,
+        1 - (wm.embedding <=> query_embedding) as similarity,
+        wm.created_at
+    FROM working_memory wm
+    ORDER BY wm.embedding <=> query_embedding
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create new cluster with automatic centroid embedding
+CREATE OR REPLACE FUNCTION create_memory_cluster(
+    p_name TEXT,
+    p_cluster_type cluster_type,
+    p_description TEXT DEFAULT NULL,
+    p_initial_memories UUID[] DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    cluster_id UUID;
+    centroid_vec vector(1536);
+    memory_embeddings vector(1536)[];
+    i INT;
+BEGIN
+    -- If initial memories provided, calculate centroid
+    IF p_initial_memories IS NOT NULL AND array_length(p_initial_memories, 1) > 0 THEN
+        -- Calculate average (simplified - in production, use proper vector averaging)
+        SELECT AVG(embedding)::vector(1536) INTO centroid_vec
+        FROM memories
+        WHERE id = ANY(p_initial_memories)
+        AND status = 'active';
+    END IF;
+    
+    -- Create cluster
+    INSERT INTO memory_clusters (name, cluster_type, description, centroid_embedding)
+    VALUES (p_name, p_cluster_type, p_description, centroid_vec)
+    RETURNING id INTO cluster_id;
+    
+    -- Add initial memories to cluster
+    IF p_initial_memories IS NOT NULL THEN
+        FOR i IN 1..array_length(p_initial_memories, 1) LOOP
+            INSERT INTO memory_cluster_members (cluster_id, memory_id)
+            VALUES (cluster_id, p_initial_memories[i]);
+        END LOOP;
+    END IF;
+    
+    RETURN cluster_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Batch create memories (more efficient for multiple memories)
+CREATE OR REPLACE FUNCTION batch_create_memories(
+    p_memories JSONB -- Array of {type, content, importance}
+) RETURNS UUID[] AS $$
+DECLARE
+    memory_ids UUID[];
+    memory_record JSONB;
+    new_memory_id UUID;
+BEGIN
+    -- Process each memory
+    FOR memory_record IN SELECT * FROM jsonb_array_elements(p_memories)
+    LOOP
+        new_memory_id := create_memory(
+            (memory_record->>'type')::memory_type,
+            memory_record->>'content',
+            COALESCE((memory_record->>'importance')::FLOAT, 0.5)
+        );
+        memory_ids := array_append(memory_ids, new_memory_id);
+    END LOOP;
+    
+    RETURN memory_ids;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Monitor embedding service health
+CREATE OR REPLACE FUNCTION check_embedding_service_health()
+RETURNS BOOLEAN AS $$
+DECLARE
+    service_url TEXT;
+    response http_response;
+BEGIN
+    SELECT value INTO service_url FROM embedding_config WHERE key = 'service_url';
+    
+    SELECT * INTO response FROM http_get(replace(service_url, '/embed', '/health'));
+    
+    RETURN response.status = 200;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Clean old embedding cache entries
+CREATE OR REPLACE FUNCTION cleanup_embedding_cache(
+    p_older_than INTERVAL DEFAULT INTERVAL '7 days'
+) RETURNS INT AS $$
+DECLARE
+    deleted_count INT;
+BEGIN
+    WITH deleted AS (
+        DELETE FROM embedding_cache
+        WHERE created_at < CURRENT_TIMESTAMP - p_older_than
+        RETURNING 1
+    )
+    SELECT COUNT(*) INTO deleted_count FROM deleted;
+    
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function comments for documentation
+COMMENT ON FUNCTION create_memory IS 'Creates a memory with automatic embedding generation. Usage: SELECT create_memory(''semantic'', ''The user prefers dark mode interfaces'', 0.7);';
+
+COMMENT ON FUNCTION search_similar_memories IS 'Search memories by semantic similarity. Usage: SELECT * FROM search_similar_memories(''user interface preferences'', 10);';
+
+COMMENT ON FUNCTION create_episodic_memory IS 'Creates an episodic memory with automatic embedding. Usage: SELECT create_episodic_memory(''User clicked help button'', ''{"action": "click"}'', ''{"page": "settings"}'', ''{"displayed": "help_modal"}'', 0.0);';
+
+COMMENT ON FUNCTION create_semantic_memory IS 'Creates a semantic memory with automatic embedding. Usage: SELECT create_semantic_memory(''User prefers dark themes'', 0.9, ARRAY[''preference''], ARRAY[''UI'', ''theme'']);';
+
+COMMENT ON FUNCTION create_procedural_memory IS 'Creates a procedural memory with automatic embedding. Usage: SELECT create_procedural_memory(''How to reset password'', ''{"steps": ["click forgot", "enter email", "check inbox"]}'');';
+
+COMMENT ON FUNCTION create_strategic_memory IS 'Creates a strategic memory with automatic embedding. Usage: SELECT create_strategic_memory(''User engagement pattern'', ''Users engage more with visual content'', 0.8);';
+
+COMMENT ON FUNCTION batch_create_memories IS 'Batch create multiple memories efficiently. Usage: SELECT batch_create_memories(''[{"type": "semantic", "content": "fact1"}, {"type": "episodic", "content": "event1"}]'');';
+
+COMMENT ON FUNCTION check_embedding_service_health IS 'Check if the embedding service is healthy. Usage: SELECT check_embedding_service_health();';

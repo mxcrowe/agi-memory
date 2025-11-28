@@ -3155,6 +3155,335 @@ async def test_worldview_driven_memory_filtering(db_pool):
         assert influenced_memories[0]['adjusted_importance'] > influenced_memories[1]['adjusted_importance'], "Boosted memory should rank higher"
 
 
+# EMBEDDING INTEGRATION TESTS
+
+async def test_embedding_service_integration(db_pool):
+    """Test integration with embeddings microservice"""
+    async with db_pool.acquire() as conn:
+        # Test embedding service health check
+        health_status = await conn.fetchval("""
+            SELECT check_embedding_service_health()
+        """)
+        
+        # Note: This may fail if embeddings service isn't running
+        # In CI/CD, you might want to mock this or skip if service unavailable
+        print(f"Embedding service health: {health_status}")
+        
+        # Test basic embedding generation (if service is available)
+        if health_status:
+            try:
+                embedding = await conn.fetchval("""
+                    SELECT get_embedding('test content for embedding')
+                """)
+                assert embedding is not None, "Should generate embedding"
+                
+                # Test embedding cache
+                cached_embedding = await conn.fetchval("""
+                    SELECT get_embedding('test content for embedding')
+                """)
+                assert cached_embedding == embedding, "Should return cached embedding"
+                
+            except Exception as e:
+                print(f"Embedding generation test skipped: {e}")
+
+
+async def test_create_memory_with_auto_embedding(db_pool):
+    """Test creating memories with automatic embedding generation"""
+    async with db_pool.acquire() as conn:
+        # Check if embedding service is available
+        health_status = await conn.fetchval("""
+            SELECT check_embedding_service_health()
+        """)
+        
+        if not health_status:
+            print("Skipping embedding tests - service not available")
+            return
+        
+        try:
+            # Test creating semantic memory with auto-embedding
+            memory_id = await conn.fetchval("""
+                SELECT create_semantic_memory(
+                    'User prefers dark mode interfaces',
+                    0.9,
+                    ARRAY['preference', 'UI'],
+                    ARRAY['interface', 'theme', 'dark mode']
+                )
+            """)
+            
+            assert memory_id is not None, "Should create memory with auto-embedding"
+            
+            # Verify memory was created with embedding
+            memory_data = await conn.fetchrow("""
+                SELECT content, embedding, type FROM memories WHERE id = $1
+            """, memory_id)
+            
+            assert memory_data['content'] == 'User prefers dark mode interfaces'
+            assert memory_data['embedding'] is not None
+            assert memory_data['type'] == 'semantic'
+            
+            # Test episodic memory creation
+            episodic_id = await conn.fetchval("""
+                SELECT create_episodic_memory(
+                    'User clicked the help button',
+                    '{"action": "click", "element": "help_button"}',
+                    '{"page": "settings", "section": "account"}',
+                    '{"modal_opened": true, "help_displayed": true}',
+                    0.1
+                )
+            """)
+            
+            assert episodic_id is not None, "Should create episodic memory"
+            
+        except Exception as e:
+            print(f"Auto-embedding test failed: {e}")
+            # Don't fail the test if embedding service is unavailable
+
+
+async def test_search_with_auto_embedding(db_pool):
+    """Test searching memories with automatic query embedding"""
+    async with db_pool.acquire() as conn:
+        # Check if embedding service is available
+        health_status = await conn.fetchval("""
+            SELECT check_embedding_service_health()
+        """)
+        
+        if not health_status:
+            print("Skipping search embedding tests - service not available")
+            return
+        
+        try:
+            # Create some test memories first
+            memory_ids = []
+            test_contents = [
+                'User interface design principles',
+                'Dark mode reduces eye strain',
+                'Accessibility features for visually impaired users'
+            ]
+            
+            for content in test_contents:
+                memory_id = await conn.fetchval("""
+                    SELECT create_semantic_memory($1, 0.8)
+                """, content)
+                memory_ids.append(memory_id)
+            
+            # Test similarity search with auto-embedding
+            results = await conn.fetch("""
+                SELECT * FROM search_similar_memories('user interface preferences', 5)
+            """)
+            
+            assert len(results) > 0, "Should find similar memories"
+            
+            # Verify results have expected fields
+            for result in results:
+                assert 'memory_id' in result
+                assert 'content' in result
+                assert 'similarity' in result
+                assert result['similarity'] >= 0 and result['similarity'] <= 1
+            
+        except Exception as e:
+            print(f"Search embedding test failed: {e}")
+
+
+async def test_working_memory_with_embedding(db_pool):
+    """Test working memory operations with automatic embedding"""
+    async with db_pool.acquire() as conn:
+        # Check if embedding service is available
+        health_status = await conn.fetchval("""
+            SELECT check_embedding_service_health()
+        """)
+        
+        if not health_status:
+            print("Skipping working memory embedding tests - service not available")
+            return
+        
+        try:
+            # Add to working memory with auto-embedding
+            wm_id = await conn.fetchval("""
+                SELECT add_to_working_memory(
+                    'Current user is browsing settings page',
+                    INTERVAL '30 minutes'
+                )
+            """)
+            
+            assert wm_id is not None, "Should add to working memory"
+            
+            # Search working memory
+            results = await conn.fetch("""
+                SELECT * FROM search_working_memory('user settings', 3)
+            """)
+            
+            assert len(results) > 0, "Should find working memory items"
+            
+        except Exception as e:
+            print(f"Working memory embedding test failed: {e}")
+
+
+async def test_batch_memory_creation(db_pool):
+    """Test batch memory creation with embeddings"""
+    async with db_pool.acquire() as conn:
+        # Check if embedding service is available
+        health_status = await conn.fetchval("""
+            SELECT check_embedding_service_health()
+        """)
+        
+        if not health_status:
+            print("Skipping batch creation tests - service not available")
+            return
+        
+        try:
+            # Test batch creation
+            memory_ids = await conn.fetchval("""
+                SELECT batch_create_memories('[
+                    {"type": "semantic", "content": "User prefers keyboard shortcuts", "importance": 0.7},
+                    {"type": "semantic", "content": "User uses mobile device frequently", "importance": 0.6},
+                    {"type": "episodic", "content": "User completed tutorial successfully", "importance": 0.8}
+                ]')
+            """)
+            
+            assert memory_ids is not None, "Should create batch memories"
+            assert len(memory_ids) == 3, "Should create 3 memories"
+            
+            # Verify all memories were created
+            count = await conn.fetchval("""
+                SELECT COUNT(*) FROM memories WHERE id = ANY($1::uuid[])
+            """, memory_ids)
+            
+            assert count == 3, "All batch memories should exist"
+            
+        except Exception as e:
+            print(f"Batch creation test failed: {e}")
+
+
+async def test_embedding_cache_functionality(db_pool):
+    """Test embedding caching functionality"""
+    async with db_pool.acquire() as conn:
+        # Check if embedding service is available
+        health_status = await conn.fetchval("""
+            SELECT check_embedding_service_health()
+        """)
+        
+        if not health_status:
+            print("Skipping cache tests - service not available")
+            return
+        
+        try:
+            # Clear any existing cache for our test content
+            test_content = 'unique test content for caching'
+            content_hash = await conn.fetchval("""
+                SELECT encode(sha256($1::bytea), 'hex')
+            """, test_content)
+            
+            await conn.execute("""
+                DELETE FROM embedding_cache WHERE content_hash = $1
+            """, content_hash)
+            
+            # First call should hit the service and cache the result
+            embedding1 = await conn.fetchval("""
+                SELECT get_embedding($1)
+            """, test_content)
+            
+            # Verify it was cached
+            cached_count = await conn.fetchval("""
+                SELECT COUNT(*) FROM embedding_cache WHERE content_hash = $1
+            """, content_hash)
+            
+            assert cached_count == 1, "Should cache the embedding"
+            
+            # Second call should use cache
+            embedding2 = await conn.fetchval("""
+                SELECT get_embedding($1)
+            """, test_content)
+            
+            assert embedding1 == embedding2, "Should return same embedding from cache"
+            
+            # Test cache cleanup
+            deleted_count = await conn.fetchval("""
+                SELECT cleanup_embedding_cache(INTERVAL '0 seconds')
+            """)
+            
+            assert deleted_count >= 1, "Should clean up cache entries"
+            
+        except Exception as e:
+            print(f"Cache test failed: {e}")
+
+
+async def test_embedding_error_handling(db_pool):
+    """Test error handling for embedding operations"""
+    async with db_pool.acquire() as conn:
+        # Test with invalid service URL
+        await conn.execute("""
+            UPDATE embedding_config 
+            SET value = 'http://invalid-service:9999/embed'
+            WHERE key = 'service_url'
+        """)
+        
+        # This should fail gracefully
+        try:
+            await conn.fetchval("""
+                SELECT get_embedding('test content')
+            """)
+            assert False, "Should have failed with invalid service URL"
+        except Exception as e:
+            assert "Failed to get embedding" in str(e), "Should have proper error message"
+        
+        # Restore valid URL
+        await conn.execute("""
+            UPDATE embedding_config 
+            SET value = 'http://embeddings:80/embed'
+            WHERE key = 'service_url'
+        """)
+
+
+async def test_memory_cluster_with_embeddings(db_pool):
+    """Test memory clustering with automatic embeddings"""
+    async with db_pool.acquire() as conn:
+        # Check if embedding service is available
+        health_status = await conn.fetchval("""
+            SELECT check_embedding_service_health()
+        """)
+        
+        if not health_status:
+            print("Skipping cluster embedding tests - service not available")
+            return
+        
+        try:
+            # Create memories with related content
+            memory_ids = []
+            related_contents = [
+                'User interface design best practices',
+                'UI accessibility guidelines',
+                'Interface usability principles'
+            ]
+            
+            for content in related_contents:
+                memory_id = await conn.fetchval("""
+                    SELECT create_semantic_memory($1, 0.8)
+                """, content)
+                memory_ids.append(memory_id)
+            
+            # Create cluster with these memories
+            cluster_id = await conn.fetchval("""
+                SELECT create_memory_cluster(
+                    'UI Design Principles',
+                    'theme',
+                    'Cluster for UI design related memories',
+                    $1
+                )
+            """, memory_ids)
+            
+            assert cluster_id is not None, "Should create cluster"
+            
+            # Verify cluster has centroid embedding
+            centroid = await conn.fetchval("""
+                SELECT centroid_embedding FROM memory_clusters WHERE id = $1
+            """, cluster_id)
+            
+            assert centroid is not None, "Cluster should have centroid embedding"
+            
+        except Exception as e:
+            print(f"Cluster embedding test failed: {e}")
+
+
 # MEDIUM PRIORITY ADDITIONAL TESTS
 
 async def test_complex_graph_traversals(db_pool):

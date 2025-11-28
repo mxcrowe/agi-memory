@@ -22,7 +22,7 @@ services:
       bash -c "
         # Install dependencies
         apt-get update &&
-        apt-get install -y flex bison git build-essential postgresql-server-dev-16 cmake pkg-config libxml2-dev postgresql-contrib &&
+        apt-get install -y flex bison git build-essential postgresql-server-dev-16 cmake pkg-config libxml2-dev postgresql-contrib postgresql-16-http &&
         
         # Setup bison
         which bison &&
@@ -46,5 +46,32 @@ services:
         # Start PostgreSQL
         docker-entrypoint.sh postgres"
 
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8.3
+    platform: linux/amd64
+    command: 
+      - --model-id
+      - unsloth/embeddinggemma-300m
+      - --dtype
+      - float32
+      - --pooling
+      - mean
+    ports:
+      - "8080:80"
+    environment:
+      - DTYPE=float32
+      - MAX_CONCURRENT_REQUESTS=512
+      - MODEL_ID=unsloth/embeddinggemma-300m
+      - CANDLE_DISABLE_BLAS=1
+    volumes:
+      - embeddings_cache:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
 volumes:
   postgres_data:
+  embeddings_cache:
