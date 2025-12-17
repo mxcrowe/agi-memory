@@ -138,8 +138,80 @@ CREATE TABLE working_memory (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     content TEXT NOT NULL,
     embedding vector(768) NOT NULL,
+    importance FLOAT DEFAULT 0.3,
+    source_attribution JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trust_level FLOAT NOT NULL DEFAULT 0.5 CHECK (trust_level >= 0 AND trust_level <= 1),
+    access_count INTEGER DEFAULT 0,
+    last_accessed TIMESTAMPTZ,
+    promote_to_long_term BOOLEAN NOT NULL DEFAULT FALSE,
     expiry TIMESTAMPTZ
 );
+
+-- Ingestion receipts (idempotency for ingest.py and other batch importers)
+CREATE TABLE ingestion_receipts (
+    source_file TEXT NOT NULL,
+    chunk_index INT NOT NULL,
+    content_hash TEXT NOT NULL,
+    memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_file, content_hash)
+);
+
+CREATE INDEX idx_ingestion_receipts_hash ON ingestion_receipts (content_hash);
+
+CREATE OR REPLACE FUNCTION get_ingestion_receipts(
+    p_source_file TEXT,
+    p_content_hashes TEXT[]
+)
+RETURNS TABLE (
+    content_hash TEXT,
+    memory_id UUID
+) AS $$
+BEGIN
+    IF p_content_hashes IS NULL OR array_length(p_content_hashes, 1) IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT ir.content_hash, ir.memory_id
+    FROM ingestion_receipts ir
+    WHERE ir.source_file = p_source_file
+      AND ir.content_hash = ANY(p_content_hashes);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION record_ingestion_receipts(p_items JSONB)
+RETURNS INT AS $$
+DECLARE
+    inserted_count INT := 0;
+BEGIN
+    IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' THEN
+        RETURN 0;
+    END IF;
+
+    WITH to_insert AS (
+        SELECT
+            NULLIF(e->>'source_file', '') AS source_file,
+            COALESCE(NULLIF(e->>'chunk_index', '')::int, 0) AS chunk_index,
+            NULLIF(e->>'content_hash', '') AS content_hash,
+            NULLIF(e->>'memory_id', '')::uuid AS memory_id
+        FROM jsonb_array_elements(p_items) e
+    ),
+    inserted AS (
+        INSERT INTO ingestion_receipts (source_file, chunk_index, content_hash, memory_id)
+        SELECT source_file, chunk_index, content_hash, memory_id
+        FROM to_insert
+        WHERE source_file IS NOT NULL
+          AND content_hash IS NOT NULL
+          AND memory_id IS NOT NULL
+        ON CONFLICT DO NOTHING
+        RETURNING 1
+    )
+    SELECT COUNT(*) INTO inserted_count FROM inserted;
+
+    RETURN COALESCE(inserted_count, 0);
+END;
+$$ LANGUAGE plpgsql;
 
 -- ============================================================================
 -- CLUSTERING (Relational Only)
@@ -265,10 +337,12 @@ CREATE TABLE worldview_memory_influences (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     worldview_id UUID REFERENCES worldview_primitives(id) ON DELETE CASCADE,
     memory_id UUID REFERENCES memories(id) ON DELETE CASCADE,
-    influence_type TEXT,
-    strength FLOAT,
+    influence_type TEXT NOT NULL DEFAULT 'evidence',
+    strength FLOAT NOT NULL DEFAULT 0.0,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX idx_worldview_influences_unique ON worldview_memory_influences (worldview_id, memory_id, influence_type);
 
 -- Identity aspects (normalized from single blob)
 CREATE TABLE identity_aspects (
@@ -782,23 +856,23 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	    RETURN QUERY
 	    WITH 
     -- Vector seeds (semantic similarity)
-    seeds AS (
-        SELECT 
-            m.id, 
-            m.content, 
-            m.type,
+	    seeds AS (
+	        SELECT 
+	            m.id, 
+	            m.content, 
+	            m.type,
             m.importance,
             m.decay_rate,
             m.created_at,
             m.last_accessed,
             1 - (m.embedding <=> query_embedding) as sim
         FROM memories m
-        WHERE m.status = 'active'
-          AND m.embedding IS NOT NULL
-          AND m.embedding <> zero_vec
-        ORDER BY m.embedding <=> query_embedding
-        LIMIT 5
-    ),
+	        WHERE m.status = 'active'
+	          AND m.embedding IS NOT NULL
+	          AND m.embedding <> zero_vec
+	        ORDER BY m.embedding <=> query_embedding
+	        LIMIT GREATEST(p_limit, 5)
+	    ),
     -- Expand via precomputed neighborhoods
     associations AS (
         SELECT 
@@ -901,6 +975,9 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         observed_at := CURRENT_TIMESTAMP;
     END;
+    IF observed_at IS NULL THEN
+        observed_at := CURRENT_TIMESTAMP;
+    END IF;
 
     trust := COALESCE(NULLIF(p_source->>'trust', '')::float, 0.5);
     trust := LEAST(1.0, GREATEST(0.0, trust));
@@ -1181,18 +1258,57 @@ CREATE TRIGGER trg_semantic_trust_sync
     FOR EACH ROW
     EXECUTE FUNCTION trg_sync_semantic_trust();
 
-CREATE OR REPLACE FUNCTION trg_sync_worldview_influence_trust()
-RETURNS TRIGGER AS $$
+-- Update a worldview belief's confidence based on recent supporting/contradicting influences.
+-- This is intentionally conservative: confidence shifts slowly, weighted by memory trust.
+CREATE OR REPLACE FUNCTION update_worldview_confidence_from_influences(
+    p_worldview_id UUID,
+    p_window INTERVAL DEFAULT INTERVAL '30 days',
+    p_learning_rate FLOAT DEFAULT 0.05
+)
+RETURNS VOID AS $$
 DECLARE
-    mem_id UUID;
+    delta FLOAT;
+    base_conf FLOAT;
 BEGIN
-    mem_id := COALESCE(NEW.memory_id, OLD.memory_id);
-    IF mem_id IS NOT NULL THEN
-        PERFORM sync_memory_trust(mem_id);
+    IF p_worldview_id IS NULL THEN
+        RETURN;
     END IF;
-    RETURN COALESCE(NEW, OLD);
+
+    SELECT COALESCE(AVG(COALESCE(wmi.strength, 0) * COALESCE(m.trust_level, 0.5)), 0)
+    INTO delta
+    FROM worldview_memory_influences wmi
+    JOIN memories m ON m.id = wmi.memory_id
+    WHERE wmi.worldview_id = p_worldview_id
+      AND wmi.created_at >= CURRENT_TIMESTAMP - COALESCE(p_window, INTERVAL '30 days');
+
+    SELECT COALESCE(confidence, 0.5) INTO base_conf
+    FROM worldview_primitives
+    WHERE id = p_worldview_id;
+
+    UPDATE worldview_primitives
+    SET confidence = LEAST(1.0, GREATEST(0.0, base_conf + COALESCE(p_learning_rate, 0.05) * COALESCE(delta, 0))),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_worldview_id;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION trg_sync_worldview_influence_trust()
+RETURNS TRIGGER AS $$
+	DECLARE
+	    mem_id UUID;
+	    wid UUID;
+	BEGIN
+	    mem_id := COALESCE(NEW.memory_id, OLD.memory_id);
+	    IF mem_id IS NOT NULL THEN
+	        PERFORM sync_memory_trust(mem_id);
+	    END IF;
+	    wid := COALESCE(NEW.worldview_id, OLD.worldview_id);
+	    IF wid IS NOT NULL THEN
+	        PERFORM update_worldview_confidence_from_influences(wid);
+	    END IF;
+	    RETURN COALESCE(NEW, OLD);
+	END;
+	$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_worldview_influence_trust_sync ON worldview_memory_influences;
 CREATE TRIGGER trg_worldview_influence_trust_sync
@@ -1409,6 +1525,233 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Batch create memories from JSONB items.
+-- Each item must include: {"type": "semantic|episodic|procedural|strategic", "content": "..."}
+-- Optional keys: importance, emotional_valence, context, action_taken, result, event_time,
+--                confidence, category, related_concepts, source_references, steps, prerequisites,
+--                pattern_description, supporting_evidence, context_applicability,
+--                source_attribution, trust_level.
+CREATE OR REPLACE FUNCTION batch_create_memories(p_items JSONB)
+RETURNS UUID[] AS $$
+DECLARE
+    ids UUID[] := ARRAY[]::UUID[];
+    item JSONB;
+    mtype memory_type;
+    content TEXT;
+    importance FLOAT;
+    new_id UUID;
+    idx INT := 0;
+BEGIN
+    IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' THEN
+        RETURN ids;
+    END IF;
+
+    FOR item IN SELECT * FROM jsonb_array_elements(p_items)
+    LOOP
+        idx := idx + 1;
+        mtype := NULLIF(item->>'type', '')::memory_type;
+        content := NULLIF(item->>'content', '');
+        IF content IS NULL OR mtype IS NULL THEN
+            RAISE EXCEPTION 'batch_create_memories: item % missing required fields', idx;
+        END IF;
+        importance := COALESCE(NULLIF(item->>'importance', '')::float, 0.5);
+
+        IF mtype = 'episodic' THEN
+            new_id := create_episodic_memory(
+                content,
+                item->'action_taken',
+                item->'context',
+                item->'result',
+                COALESCE(NULLIF(item->>'emotional_valence', '')::float, 0.0),
+                COALESCE(NULLIF(item->>'event_time', '')::timestamptz, CURRENT_TIMESTAMP),
+                importance,
+                item->'source_attribution',
+                NULLIF(item->>'trust_level', '')::float
+            );
+        ELSIF mtype = 'semantic' THEN
+            new_id := create_semantic_memory(
+                content,
+                COALESCE(NULLIF(item->>'confidence', '')::float, 0.8),
+                CASE WHEN item ? 'category' THEN ARRAY(SELECT jsonb_array_elements_text(item->'category')) ELSE NULL END,
+                CASE WHEN item ? 'related_concepts' THEN ARRAY(SELECT jsonb_array_elements_text(item->'related_concepts')) ELSE NULL END,
+                item->'source_references',
+                importance,
+                item->'source_attribution',
+                NULLIF(item->>'trust_level', '')::float
+            );
+        ELSIF mtype = 'procedural' THEN
+            new_id := create_procedural_memory(
+                content,
+                COALESCE(item->'steps', jsonb_build_object('steps', '[]'::jsonb)),
+                item->'prerequisites',
+                importance,
+                item->'source_attribution',
+                NULLIF(item->>'trust_level', '')::float
+            );
+        ELSIF mtype = 'strategic' THEN
+            new_id := create_strategic_memory(
+                content,
+                COALESCE(NULLIF(item->>'pattern_description', ''), content),
+                COALESCE(NULLIF(item->>'confidence_score', '')::float, 0.8),
+                item->'supporting_evidence',
+                item->'context_applicability',
+                importance,
+                item->'source_attribution',
+                NULLIF(item->>'trust_level', '')::float
+            );
+        ELSE
+            RAISE EXCEPTION 'batch_create_memories: item % invalid type %', idx, mtype::text;
+        END IF;
+
+        IF new_id IS NULL THEN
+            RAISE EXCEPTION 'batch_create_memories: item % failed to create memory', idx;
+        END IF;
+        ids := array_append(ids, new_id);
+    END LOOP;
+
+    RETURN ids;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create memory with a precomputed embedding (used for batched/externally-generated embeddings).
+CREATE OR REPLACE FUNCTION create_memory_with_embedding(
+    p_type memory_type,
+    p_content TEXT,
+    p_embedding vector,
+    p_importance FLOAT DEFAULT 0.5,
+    p_source_attribution JSONB DEFAULT NULL,
+    p_trust_level FLOAT DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    new_memory_id UUID;
+    normalized_source JSONB;
+    effective_trust FLOAT;
+BEGIN
+    IF p_embedding IS NULL THEN
+        RAISE EXCEPTION 'embedding must not be NULL';
+    END IF;
+
+    normalized_source := normalize_source_reference(p_source_attribution);
+    IF normalized_source = '{}'::jsonb THEN
+        normalized_source := jsonb_build_object(
+            'kind',
+            CASE
+                WHEN p_type = 'semantic' THEN 'unattributed'
+                ELSE 'internal'
+            END,
+            'observed_at', CURRENT_TIMESTAMP
+        );
+    END IF;
+
+    effective_trust := p_trust_level;
+    IF effective_trust IS NULL THEN
+        effective_trust := CASE
+            WHEN p_type = 'episodic' THEN 0.95
+            WHEN p_type = 'semantic' THEN 0.20
+            WHEN p_type = 'procedural' THEN 0.70
+            WHEN p_type = 'strategic' THEN 0.70
+            ELSE 0.50
+        END;
+    END IF;
+    effective_trust := LEAST(1.0, GREATEST(0.0, effective_trust));
+
+    INSERT INTO memories (type, content, embedding, importance, source_attribution, trust_level, trust_updated_at)
+    VALUES (p_type, p_content, p_embedding, p_importance, normalized_source, effective_trust, CURRENT_TIMESTAMP)
+    RETURNING id INTO new_memory_id;
+
+    EXECUTE format(
+        'SELECT * FROM cypher(''memory_graph'', $q$
+            CREATE (n:MemoryNode {memory_id: %L, type: %L, created_at: %L})
+            RETURN n
+        $q$) as (result agtype)',
+        new_memory_id,
+        p_type,
+        CURRENT_TIMESTAMP
+    );
+
+    RETURN new_memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Batch create memories with precomputed embeddings (single type, no per-item metadata).
+-- Inserts the base row, creates the MemoryNode, and creates the type-specific row with safe defaults.
+CREATE OR REPLACE FUNCTION batch_create_memories_with_embeddings(
+    p_type memory_type,
+    p_contents TEXT[],
+    p_embeddings JSONB,
+    p_importance FLOAT DEFAULT 0.5
+)
+RETURNS UUID[] AS $$
+DECLARE
+    ids UUID[] := ARRAY[]::UUID[];
+    n INT;
+    i INT;
+    expected_dim INT;
+    emb_vec vector;
+    emb_json JSONB;
+    emb_arr FLOAT4[];
+    new_id UUID;
+BEGIN
+    n := COALESCE(array_length(p_contents, 1), 0);
+    IF n = 0 THEN
+        RETURN ids;
+    END IF;
+
+    IF p_embeddings IS NULL OR jsonb_typeof(p_embeddings) <> 'array' THEN
+        RAISE EXCEPTION 'embeddings must be a JSON array';
+    END IF;
+    IF jsonb_array_length(p_embeddings) <> n THEN
+        RAISE EXCEPTION 'contents and embeddings length mismatch';
+    END IF;
+
+    expected_dim := embedding_dimension();
+
+    FOR i IN 1..n LOOP
+        IF p_contents[i] IS NULL OR p_contents[i] = '' THEN
+            CONTINUE;
+        END IF;
+
+        emb_json := p_embeddings->(i - 1);
+        IF emb_json IS NULL OR jsonb_typeof(emb_json) <> 'array' THEN
+            RAISE EXCEPTION 'embedding % must be a JSON array', i;
+        END IF;
+
+        SELECT ARRAY_AGG(value::float4) INTO emb_arr
+        FROM jsonb_array_elements_text(emb_json) value;
+
+        IF COALESCE(array_length(emb_arr, 1), 0) <> expected_dim THEN
+            RAISE EXCEPTION 'embedding dimension mismatch: expected %, got %', expected_dim, COALESCE(array_length(emb_arr, 1), 0);
+        END IF;
+
+        emb_vec := (emb_arr::float4[])::vector;
+        new_id := create_memory_with_embedding(p_type, p_contents[i], emb_vec, p_importance);
+
+        IF p_type = 'episodic' THEN
+            INSERT INTO episodic_memories (memory_id, action_taken, context, result, emotional_valence, verification_status, event_time)
+            VALUES (new_id, NULL, jsonb_build_object('type', 'raw_batch'), NULL, 0.0, NULL, CURRENT_TIMESTAMP)
+            ON CONFLICT (memory_id) DO NOTHING;
+        ELSIF p_type = 'semantic' THEN
+            INSERT INTO semantic_memories (memory_id, confidence, last_validated, source_references, contradictions, category, related_concepts)
+            VALUES (new_id, 0.8, CURRENT_TIMESTAMP, '[]'::jsonb, NULL, NULL, NULL)
+            ON CONFLICT (memory_id) DO NOTHING;
+            PERFORM sync_memory_trust(new_id);
+        ELSIF p_type = 'procedural' THEN
+            INSERT INTO procedural_memories (memory_id, steps, prerequisites)
+            VALUES (new_id, jsonb_build_object('steps', '[]'::jsonb), NULL)
+            ON CONFLICT (memory_id) DO NOTHING;
+        ELSIF p_type = 'strategic' THEN
+            INSERT INTO strategic_memories (memory_id, pattern_description, supporting_evidence, confidence_score, success_metrics, adaptation_history, context_applicability)
+            VALUES (new_id, p_contents[i], NULL, 0.8, NULL, NULL, NULL)
+            ON CONFLICT (memory_id) DO NOTHING;
+        END IF;
+
+        ids := array_append(ids, new_id);
+    END LOOP;
+
+    RETURN ids;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Search similar memories
 CREATE OR REPLACE FUNCTION search_similar_memories(
     p_query_text TEXT,
@@ -1575,41 +1918,169 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Clean expired working memory
-CREATE OR REPLACE FUNCTION cleanup_working_memory()
-RETURNS INT AS $$
-DECLARE
-    deleted_count INT;
+-- Touch working memory rows (access tracking for consolidation heuristics)
+CREATE OR REPLACE FUNCTION touch_working_memory(p_ids UUID[])
+RETURNS VOID AS $$
 BEGIN
+    IF p_ids IS NULL OR array_length(p_ids, 1) IS NULL THEN
+        RETURN;
+    END IF;
+
+    UPDATE working_memory
+    SET access_count = access_count + 1,
+        last_accessed = CURRENT_TIMESTAMP
+    WHERE id = ANY(p_ids);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Promote a working-memory item into long-term episodic memory (preserving the existing embedding).
+CREATE OR REPLACE FUNCTION promote_working_memory_to_episodic(
+    p_working_memory_id UUID,
+    p_importance FLOAT DEFAULT NULL
+)
+RETURNS UUID AS $$
+DECLARE
+    wm RECORD;
+    new_id UUID;
+    affect JSONB;
+    v_valence FLOAT;
+BEGIN
+    SELECT * INTO wm FROM working_memory WHERE id = p_working_memory_id;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+
+    affect := get_current_affective_state();
+    BEGIN
+        v_valence := NULLIF(affect->>'valence', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_valence := 0.0;
+    END;
+    v_valence := LEAST(1.0, GREATEST(-1.0, COALESCE(v_valence, 0.0)));
+
+    new_id := create_memory_with_embedding(
+        'episodic'::memory_type,
+        wm.content,
+        wm.embedding,
+        COALESCE(p_importance, wm.importance, 0.4),
+        wm.source_attribution,
+        wm.trust_level
+    );
+
+    INSERT INTO episodic_memories (memory_id, action_taken, context, result, emotional_valence, verification_status, event_time)
+    VALUES (
+        new_id,
+        NULL,
+        jsonb_build_object(
+            'from_working_memory_id', wm.id,
+            'promoted_at', CURRENT_TIMESTAMP,
+            'working_memory_created_at', wm.created_at,
+            'working_memory_expiry', wm.expiry,
+            'source_attribution', wm.source_attribution
+        ),
+        NULL,
+        v_valence,
+        NULL,
+        wm.created_at
+    )
+    ON CONFLICT (memory_id) DO NOTHING;
+
+    RETURN new_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Clean expired working memory (with optional consolidation before delete).
+CREATE OR REPLACE FUNCTION cleanup_working_memory_with_stats(
+    p_min_importance_to_promote FLOAT DEFAULT 0.75,
+    p_min_accesses_to_promote INT DEFAULT 3
+)
+RETURNS JSONB AS $$
+DECLARE
+    promoted UUID[] := ARRAY[]::uuid[];
+    rec RECORD;
+    deleted_count INT := 0;
+BEGIN
+    FOR rec IN
+        SELECT id, importance, access_count, promote_to_long_term
+        FROM working_memory
+        WHERE expiry < CURRENT_TIMESTAMP
+    LOOP
+        IF COALESCE(rec.promote_to_long_term, false)
+           OR COALESCE(rec.importance, 0) >= COALESCE(p_min_importance_to_promote, 0.75)
+           OR COALESCE(rec.access_count, 0) >= COALESCE(p_min_accesses_to_promote, 3)
+        THEN
+            promoted := array_append(promoted, promote_working_memory_to_episodic(rec.id, rec.importance));
+        END IF;
+    END LOOP;
+
     WITH deleted AS (
         DELETE FROM working_memory
         WHERE expiry < CURRENT_TIMESTAMP
         RETURNING 1
     )
     SELECT COUNT(*) INTO deleted_count FROM deleted;
-    
-    RETURN deleted_count;
+
+    RETURN jsonb_build_object(
+        'deleted_count', COALESCE(deleted_count, 0),
+        'promoted_count', COALESCE(array_length(promoted, 1), 0),
+        'promoted_ids', COALESCE(to_jsonb(promoted), '[]'::jsonb)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cleanup_working_memory()
+RETURNS INT AS $$
+DECLARE
+    stats JSONB;
+BEGIN
+    stats := cleanup_working_memory_with_stats();
+    RETURN COALESCE(NULLIF(stats->>'deleted_count', '')::int, 0);
 END;
 $$ LANGUAGE plpgsql;
 
 -- Add to working memory with auto-embedding
 CREATE OR REPLACE FUNCTION add_to_working_memory(
     p_content TEXT,
-    p_expiry INTERVAL DEFAULT INTERVAL '1 hour'
+    p_expiry INTERVAL DEFAULT INTERVAL '1 hour',
+    p_importance FLOAT DEFAULT 0.3,
+    p_source_attribution JSONB DEFAULT NULL,
+    p_trust_level FLOAT DEFAULT NULL,
+    p_promote_to_long_term BOOLEAN DEFAULT FALSE
 ) RETURNS UUID AS $$
-DECLARE
-    new_id UUID;
-    embedding_vec vector;
-BEGIN
-    embedding_vec := get_embedding(p_content);
-    
-    INSERT INTO working_memory (content, embedding, expiry)
-    VALUES (p_content, embedding_vec, CURRENT_TIMESTAMP + p_expiry)
-    RETURNING id INTO new_id;
-    
-    RETURN new_id;
-END;
-$$ LANGUAGE plpgsql;
+	DECLARE
+	    new_id UUID;
+	    embedding_vec vector;
+	    normalized_source JSONB;
+	    effective_trust FLOAT;
+	BEGIN
+	    embedding_vec := get_embedding(p_content);
+
+	    normalized_source := normalize_source_reference(p_source_attribution);
+	    IF normalized_source = '{}'::jsonb THEN
+	        normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
+	    END IF;
+	    effective_trust := p_trust_level;
+	    IF effective_trust IS NULL THEN
+	        effective_trust := 0.8;
+	    END IF;
+	    effective_trust := LEAST(1.0, GREATEST(0.0, effective_trust));
+
+	    INSERT INTO working_memory (content, embedding, importance, source_attribution, trust_level, promote_to_long_term, expiry)
+	    VALUES (
+	        p_content,
+	        embedding_vec,
+	        LEAST(1.0, GREATEST(0.0, COALESCE(p_importance, 0.3))),
+	        normalized_source,
+	        effective_trust,
+	        COALESCE(p_promote_to_long_term, false),
+	        CURRENT_TIMESTAMP + p_expiry
+	    )
+	    RETURNING id INTO new_id;
+	    
+	    RETURN new_id;
+	END;
+	$$ LANGUAGE plpgsql;
 
 -- Search working memory
 CREATE OR REPLACE FUNCTION search_working_memory(
@@ -1621,29 +2092,42 @@ CREATE OR REPLACE FUNCTION search_working_memory(
     similarity FLOAT,
     created_at TIMESTAMPTZ
 ) AS $$
-DECLARE
-    query_embedding vector;
-    zero_vec vector;
-BEGIN
-    query_embedding := get_embedding(p_query_text);
-    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
-    
-    -- Clean expired first
-    PERFORM cleanup_working_memory();
-    
-    RETURN QUERY
-    SELECT 
-        wm.id,
-        wm.content,
-        1 - (wm.embedding <=> query_embedding) as similarity,
-        wm.created_at
-    FROM working_memory wm
-    WHERE wm.embedding IS NOT NULL
-      AND wm.embedding <> zero_vec
-    ORDER BY wm.embedding <=> query_embedding
-    LIMIT p_limit;
-END;
-$$ LANGUAGE plpgsql;
+	DECLARE
+	    query_embedding vector;
+	    zero_vec vector;
+	BEGIN
+	    query_embedding := get_embedding(p_query_text);
+	    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
+	    
+	    -- Clean expired first
+	    PERFORM cleanup_working_memory();
+	    
+	    RETURN QUERY
+	    WITH ranked AS (
+	        SELECT
+	            wm.id,
+	            wm.content AS content_text,
+	            1 - (wm.embedding <=> query_embedding) as similarity,
+	            wm.created_at,
+	            (wm.embedding <=> query_embedding) as dist
+	        FROM working_memory wm
+	        WHERE wm.embedding IS NOT NULL
+	          AND wm.embedding <> zero_vec
+	        ORDER BY wm.embedding <=> query_embedding
+	        LIMIT p_limit
+	    ),
+	    touched AS (
+	        UPDATE working_memory wm
+	        SET access_count = access_count + 1,
+	            last_accessed = CURRENT_TIMESTAMP
+	        WHERE wm.id IN (SELECT id FROM ranked)
+	        RETURNING wm.id
+	    )
+	    SELECT ranked.id AS memory_id, ranked.content_text AS content, ranked.similarity, ranked.created_at
+	    FROM ranked
+	    ORDER BY ranked.dist;
+	END;
+	$$ LANGUAGE plpgsql;
 
 -- Clean old embedding cache
 CREATE OR REPLACE FUNCTION cleanup_embedding_cache(
@@ -1809,6 +2293,7 @@ CREATE TABLE goals (
     priority goal_priority DEFAULT 'queued',
     source goal_source DEFAULT 'curiosity',
     parent_goal_id UUID REFERENCES goals(id) ON DELETE SET NULL,
+    due_at TIMESTAMPTZ,
     progress JSONB DEFAULT '[]',  -- [{timestamp, note}, ...]
     blocked_by JSONB,             -- {reason, dependency_ids, ...}
     emotional_valence FLOAT DEFAULT 0.0
@@ -1890,6 +2375,7 @@ FROM drives
 ORDER BY current_level DESC;
 
 CREATE INDEX idx_goals_priority ON goals (priority) WHERE priority IN ('active', 'queued');
+CREATE INDEX idx_goals_due_at ON goals (due_at) WHERE due_at IS NOT NULL;
 CREATE INDEX idx_goals_parent ON goals (parent_goal_id);
 CREATE INDEX idx_goals_last_touched ON goals (last_touched DESC);
 CREATE INDEX idx_goals_source ON goals (source);
@@ -1939,6 +2425,23 @@ INSERT INTO heartbeat_config (key, value, description) VALUES
     ('cost_reach_out_user', 5, 'Message user'),
     ('cost_inquire_deep', 6, 'Deep web research'),
     ('cost_reach_out_public', 7, 'Public posting');
+
+-- ============================================================================
+-- SUBCONSCIOUS MAINTENANCE CONFIGURATION
+-- ============================================================================
+
+CREATE TABLE maintenance_config (
+    key TEXT PRIMARY KEY,
+    value FLOAT NOT NULL,
+    description TEXT
+);
+
+INSERT INTO maintenance_config (key, value, description) VALUES
+    ('maintenance_interval_seconds', 60, 'Seconds between subconscious maintenance ticks'),
+    ('neighborhood_batch_size', 10, 'How many stale neighborhoods to recompute per tick'),
+    ('embedding_cache_older_than_days', 7, 'Days before embedding_cache entries are eligible for cleanup'),
+    ('working_memory_promote_min_importance', 0.75, 'Working-memory items above this importance are promoted on expiry'),
+    ('working_memory_promote_min_accesses', 3, 'Working-memory items accessed >= this count are promoted on expiry');
 
 -- ============================================================================
 -- AGENT CONFIG (Bootstrap Gate)
@@ -2186,6 +2689,19 @@ CREATE TABLE heartbeat_state (
 INSERT INTO heartbeat_state (id, current_energy) VALUES (1, 10);
 
 -- ============================================================================
+-- SUBCONSCIOUS MAINTENANCE STATE (Singleton)
+-- ============================================================================
+
+CREATE TABLE maintenance_state (
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_maintenance_at TIMESTAMPTZ,
+    is_paused BOOLEAN DEFAULT FALSE,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO maintenance_state (id) VALUES (1);
+
+-- ============================================================================
 -- HEARTBEAT LOG
 -- ============================================================================
 
@@ -2249,6 +2765,31 @@ CREATE TABLE outbox_messages (
 
 CREATE INDEX idx_outbox_messages_status ON outbox_messages (status) WHERE status = 'pending';
 CREATE INDEX idx_outbox_messages_created ON outbox_messages (created_at DESC);
+
+-- Queue a user-visible message for delivery by an external integration (worker, webhook, etc.)
+CREATE OR REPLACE FUNCTION queue_user_message(
+    p_message TEXT,
+    p_intent TEXT DEFAULT NULL,
+    p_context JSONB DEFAULT NULL
+)
+RETURNS UUID AS $$
+DECLARE
+    outbox_id UUID;
+BEGIN
+    INSERT INTO outbox_messages (kind, payload)
+    VALUES (
+        'user',
+        jsonb_build_object(
+            'message', p_message,
+            'intent', p_intent,
+            'context', COALESCE(p_context, '{}'::jsonb)
+        )
+    )
+    RETURNING id INTO outbox_id;
+
+    RETURN outbox_id;
+END;
+$$ LANGUAGE plpgsql;
 
 -- ============================================================================
 -- HEARTBEAT HELPER FUNCTIONS
@@ -2325,6 +2866,97 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Check if subconscious maintenance should run (independent trigger from heartbeat).
+CREATE OR REPLACE FUNCTION should_run_maintenance()
+RETURNS BOOLEAN AS $$
+DECLARE
+    state_record RECORD;
+    interval_seconds FLOAT;
+BEGIN
+    SELECT * INTO state_record FROM maintenance_state WHERE id = 1;
+
+    IF state_record.is_paused THEN
+        RETURN FALSE;
+    END IF;
+
+    SELECT value INTO interval_seconds FROM maintenance_config WHERE key = 'maintenance_interval_seconds';
+    interval_seconds := COALESCE(interval_seconds, 60);
+    IF interval_seconds <= 0 THEN
+        RETURN FALSE;
+    END IF;
+
+    IF state_record.last_maintenance_at IS NULL THEN
+        RETURN TRUE;
+    END IF;
+
+    RETURN CURRENT_TIMESTAMP >= state_record.last_maintenance_at + (interval_seconds || ' seconds')::INTERVAL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Run a single subconscious maintenance tick: consolidation + pruning + indexing upkeep.
+CREATE OR REPLACE FUNCTION run_subconscious_maintenance(p_params JSONB DEFAULT '{}'::jsonb)
+RETURNS JSONB AS $$
+DECLARE
+    got_lock BOOLEAN;
+    min_imp FLOAT;
+    min_acc INT;
+    neighborhood_batch INT;
+    cache_days INT;
+    wm_stats JSONB;
+    recomputed INT;
+    cache_deleted INT;
+BEGIN
+    got_lock := pg_try_advisory_lock(hashtext('agi_subconscious_maintenance'));
+    IF NOT got_lock THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'locked');
+    END IF;
+
+    min_imp := COALESCE(
+        NULLIF(p_params->>'working_memory_promote_min_importance', '')::float,
+        (SELECT value FROM maintenance_config WHERE key = 'working_memory_promote_min_importance'),
+        0.75
+    );
+    min_acc := COALESCE(
+        NULLIF(p_params->>'working_memory_promote_min_accesses', '')::int,
+        (SELECT value FROM maintenance_config WHERE key = 'working_memory_promote_min_accesses')::int,
+        3
+    );
+    neighborhood_batch := COALESCE(
+        NULLIF(p_params->>'neighborhood_batch_size', '')::int,
+        (SELECT value FROM maintenance_config WHERE key = 'neighborhood_batch_size')::int,
+        10
+    );
+    cache_days := COALESCE(
+        NULLIF(p_params->>'embedding_cache_older_than_days', '')::int,
+        (SELECT value FROM maintenance_config WHERE key = 'embedding_cache_older_than_days')::int,
+        7
+    );
+
+    wm_stats := cleanup_working_memory_with_stats(min_imp, min_acc);
+    recomputed := batch_recompute_neighborhoods(neighborhood_batch);
+    cache_deleted := cleanup_embedding_cache((cache_days || ' days')::interval);
+
+    UPDATE maintenance_state
+    SET last_maintenance_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
+
+    PERFORM pg_advisory_unlock(hashtext('agi_subconscious_maintenance'));
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'working_memory', wm_stats,
+        'neighborhoods_recomputed', COALESCE(recomputed, 0),
+        'embedding_cache_deleted', COALESCE(cache_deleted, 0),
+        'ran_at', CURRENT_TIMESTAMP
+    );
+EXCEPTION
+    WHEN OTHERS THEN
+        PERFORM pg_advisory_unlock(hashtext('agi_subconscious_maintenance'));
+        RAISE;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Touch a goal (update last_touched)
 CREATE OR REPLACE FUNCTION touch_goal(p_goal_id UUID)
 RETURNS VOID AS $$
@@ -2383,7 +3015,8 @@ CREATE OR REPLACE FUNCTION create_goal(
     p_description TEXT DEFAULT NULL,
     p_source goal_source DEFAULT 'curiosity',
     p_priority goal_priority DEFAULT 'queued',
-    p_parent_id UUID DEFAULT NULL
+    p_parent_id UUID DEFAULT NULL,
+    p_due_at TIMESTAMPTZ DEFAULT NULL
 )
 RETURNS UUID AS $$
 DECLARE
@@ -2401,8 +3034,8 @@ BEGIN
         END IF;
     END IF;
 
-    INSERT INTO goals (title, description, source, priority, parent_goal_id)
-    VALUES (p_title, p_description, p_source, p_priority, p_parent_id)
+    INSERT INTO goals (title, description, source, priority, parent_goal_id, due_at)
+    VALUES (p_title, p_description, p_source, p_priority, p_parent_id, p_due_at)
     RETURNING id INTO new_goal_id;
 
     RETURN new_goal_id;
@@ -2456,6 +3089,7 @@ BEGIN
         'id', id,
         'title', title,
         'description', description,
+        'due_at', due_at,
         'last_touched', last_touched,
         'progress_count', jsonb_array_length(progress),
         'blocked_by', blocked_by
@@ -2468,13 +3102,14 @@ BEGIN
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id', id,
         'title', title,
-        'source', source
+        'source', source,
+        'due_at', due_at
     )), '[]'::jsonb)
     INTO queued_goals
     FROM (
         SELECT * FROM goals
         WHERE priority = 'queued'
-        ORDER BY last_touched DESC
+        ORDER BY due_at NULLS LAST, last_touched DESC
         LIMIT 5
     ) q;
 
@@ -2484,9 +3119,11 @@ BEGIN
         'title', title,
         'issue', CASE
             WHEN blocked_by IS NOT NULL THEN 'blocked'
+            WHEN due_at IS NOT NULL AND due_at < CURRENT_TIMESTAMP THEN 'overdue'
             WHEN last_touched < CURRENT_TIMESTAMP - (stale_days || ' days')::INTERVAL THEN 'stale'
             ELSE 'unknown'
         END,
+        'due_at', due_at,
         'days_since_touched', EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_touched)) / 86400
     )), '[]'::jsonb)
     INTO issues
@@ -2494,6 +3131,7 @@ BEGIN
     WHERE priority = 'active'
     AND (
         blocked_by IS NOT NULL
+        OR (due_at IS NOT NULL AND due_at < CURRENT_TIMESTAMP)
         OR last_touched < CURRENT_TIMESTAMP - (stale_days || ' days')::INTERVAL
     );
 
@@ -4059,7 +4697,7 @@ CREATE OR REPLACE FUNCTION process_reflection_result(
     p_result JSONB
 )
 RETURNS VOID AS $$
-DECLARE
+	DECLARE
     insight JSONB;
     ident JSONB;
     wupd JSONB;
@@ -4072,12 +4710,16 @@ DECLARE
     aspect_type TEXT;
     change_text TEXT;
     reason_text TEXT;
-    wid UUID;
-    new_conf FLOAT;
-    from_id UUID;
-    to_id UUID;
-    rel_type graph_edge_type;
-    rel_conf FLOAT;
+	    wid UUID;
+	    new_conf FLOAT;
+	    winf JSONB;
+	    wmem UUID;
+	    wstrength FLOAT;
+	    wtype TEXT;
+	    from_id UUID;
+	    to_id UUID;
+	    rel_type graph_edge_type;
+	    rel_conf FLOAT;
     ma UUID;
     mb UUID;
     sm_kind TEXT;
@@ -4125,9 +4767,9 @@ BEGIN
         END LOOP;
     END IF;
 
-    IF p_result ? 'worldview_updates' THEN
-        FOR wupd IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'worldview_updates', '[]'::jsonb))
-        LOOP
+	    IF p_result ? 'worldview_updates' THEN
+	        FOR wupd IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'worldview_updates', '[]'::jsonb))
+	        LOOP
             wid := NULLIF(wupd->>'id', '')::uuid;
             new_conf := COALESCE((wupd->>'new_confidence')::float, NULL);
             IF wid IS NOT NULL AND new_conf IS NOT NULL THEN
@@ -4136,8 +4778,36 @@ BEGIN
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = wid;
             END IF;
-        END LOOP;
-    END IF;
+	        END LOOP;
+	    END IF;
+
+	    -- Optional worldview evidence links: insert influences so trust/alignment can be computed and beliefs can update over time.
+	    IF p_result ? 'worldview_influences' THEN
+	        FOR winf IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'worldview_influences', '[]'::jsonb))
+	        LOOP
+	            BEGIN
+	                wid := NULLIF(winf->>'worldview_id', '')::uuid;
+	                wmem := NULLIF(winf->>'memory_id', '')::uuid;
+	                wstrength := COALESCE(NULLIF(winf->>'strength', '')::float, NULL);
+	                wtype := COALESCE(NULLIF(winf->>'influence_type', ''), 'evidence');
+
+	                IF wid IS NOT NULL AND wmem IS NOT NULL AND wstrength IS NOT NULL THEN
+	                    INSERT INTO worldview_memory_influences (worldview_id, memory_id, influence_type, strength)
+	                    VALUES (wid, wmem, wtype, wstrength)
+	                    ON CONFLICT (worldview_id, memory_id, influence_type) DO UPDATE
+	                    SET strength = EXCLUDED.strength,
+	                        created_at = CURRENT_TIMESTAMP;
+
+	                    IF wstrength > 0 THEN
+	                        PERFORM link_memory_supports_worldview(wmem, wid, LEAST(1.0, GREATEST(0.0, wstrength)));
+	                    END IF;
+	                END IF;
+	            EXCEPTION
+	                WHEN OTHERS THEN
+	                    NULL;
+	            END;
+	        END LOOP;
+	    END IF;
 
     IF p_result ? 'discovered_relationships' THEN
         FOR rel IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'discovered_relationships', '[]'::jsonb))
@@ -4503,19 +5173,14 @@ SELECT
     'Process LLM/embedding requests' as description
 UNION ALL
 SELECT
-    'neighborhoods',
-    (SELECT COUNT(*) FROM memory_neighborhoods WHERE is_stale = TRUE),
-    'Recompute stale memory neighborhoods'
-UNION ALL
-SELECT
     'heartbeat',
     CASE WHEN should_run_heartbeat() THEN 1 ELSE 0 END,
     'Run heartbeat if due'
 UNION ALL
 SELECT
-    'working_memory',
-    (SELECT COUNT(*) FROM working_memory WHERE expiry < CURRENT_TIMESTAMP),
-    'Clean expired working memory'
+    'subconscious_maintenance',
+    CASE WHEN should_run_maintenance() THEN 1 ELSE 0 END,
+    'Run subconscious maintenance tick (consolidate + prune)'
 UNION ALL
 SELECT
     'outbox',

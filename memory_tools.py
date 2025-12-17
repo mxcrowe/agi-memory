@@ -9,12 +9,26 @@ recall, search, and explore its memories.
 
 import json
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Optional, Any
 from enum import Enum
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    HAS_PSYCOPG2 = True
+except Exception:  # pragma: no cover
+    psycopg2 = None  # type: ignore[assignment]
+    RealDictCursor = None  # type: ignore[assignment]
+    HAS_PSYCOPG2 = False
+
+from cognitive_memory_api import (
+    CognitiveMemorySync,
+    GoalPriority as ApiGoalPriority,
+    GoalSource as ApiGoalSource,
+    MemoryType as ApiMemoryType,
+)
 
 
 # ============================================================================
@@ -215,8 +229,59 @@ MEMORY_TOOLS = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_goal",
+            "description": "Create a new goal (queued task) for the agent to pursue later. Use this for reminders, TODOs, or longer-term objectives.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short goal title"},
+                    "description": {"type": ["string", "null"], "description": "Optional longer description"},
+                    "priority": {
+                        "type": "string",
+                        "enum": ["active", "queued", "backburner"],
+                        "default": "queued",
+                        "description": "Desired priority (DB may demote if at limits)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["curiosity", "user_request", "identity", "derived", "external"],
+                        "default": "user_request",
+                        "description": "Why this goal exists"
+                    },
+                    "due_at": {
+                        "type": ["string", "null"],
+                        "description": "Optional due timestamp in ISO8601 (e.g. 2025-01-01T12:00:00Z)"
+                    }
+                },
+                "required": ["title"],
+                "additionalProperties": False
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "queue_user_message",
+            "description": "Queue a message to the user in the outbox for delivery by an external integration (worker/webhook).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Message body for the user"},
+                    "intent": {"type": ["string", "null"], "description": "Optional intent/category (e.g. 'reminder', 'status', 'question')"},
+                    "context": {"type": ["object", "null"], "description": "Optional JSON context payload"}
+                },
+                "required": ["message"],
+                "additionalProperties": False
+            }
+        }
     }
 ]
+
+_API_TOOL_NAMES = {"recall", "recall_recent", "explore_concept", "get_procedures", "get_strategies", "create_goal", "queue_user_message"}
 
 
 # ============================================================================
@@ -232,6 +297,8 @@ class MemoryToolHandler:
     
     def connect(self):
         """Establish database connection."""
+        if not HAS_PSYCOPG2:
+            raise RuntimeError("psycopg2 is required for legacy MemoryToolHandler; use CognitiveMemory API instead.")
         if not self.conn or self.conn.closed:
             self.conn = psycopg2.connect(
                 host=self.db_config.get('host', 'localhost'),
@@ -269,7 +336,7 @@ class MemoryToolHandler:
             return handler(arguments)
         except Exception as e:
             return {"error": str(e)}
-    
+
     def _handle_recall(self, args: dict) -> dict:
         """Handle the recall tool - semantic memory search."""
         query = args.get('query', '')
@@ -622,6 +689,207 @@ class MemoryToolHandler:
         }
 
 
+class ApiMemoryToolHandler:
+    """Tool handler backed by CognitiveMemorySync (asyncpg)."""
+
+    def __init__(self, db_config: dict):
+        self.db_config = db_config
+        self.client: CognitiveMemorySync | None = None
+
+    def connect(self) -> None:
+        if self.client is not None:
+            return
+        dsn = (
+            f"postgresql://{self.db_config.get('user', 'postgres')}:{self.db_config.get('password', 'password')}"
+            f"@{self.db_config.get('host', 'localhost')}:{int(self.db_config.get('port', 5432))}"
+            f"/{self.db_config.get('dbname', 'agi_memory')}"
+        )
+        self.client = CognitiveMemorySync.connect(dsn, min_size=1, max_size=5)
+
+    def close(self) -> None:
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+
+    def execute_tool(self, tool_name: str, arguments: dict) -> dict:
+        self.connect()
+        assert self.client is not None
+
+        handlers = {
+            "recall": self._handle_recall,
+            "recall_recent": self._handle_recall_recent,
+            "explore_concept": self._handle_explore_concept,
+            "get_procedures": self._handle_get_procedures,
+            "get_strategies": self._handle_get_strategies,
+            "create_goal": self._handle_create_goal,
+            "queue_user_message": self._handle_queue_user_message,
+        }
+        handler = handlers.get(tool_name)
+        if not handler:
+            return {"error": f"Unknown tool: {tool_name}"}
+        try:
+            return handler(arguments or {})
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _handle_recall(self, args: dict) -> dict:
+        query = args.get("query", "")
+        limit = min(int(args.get("limit", 5)), 20)
+        memory_types = args.get("memory_types")
+        min_importance = float(args.get("min_importance", 0.0) or 0.0)
+
+        parsed_types = None
+        if isinstance(memory_types, list) and memory_types:
+            parsed_types = [ApiMemoryType(str(t)) for t in memory_types]
+
+        result = self.client.recall(query, limit=limit, memory_types=parsed_types, min_importance=min_importance, include_partial=False)
+        self.client.touch_memories([m.id for m in result.memories])
+        memories = [
+            {
+                "memory_id": str(m.id),
+                "content": m.content,
+                "memory_type": m.type.value,
+                "score": m.similarity,
+                "source": m.source,
+                "importance": m.importance,
+                "trust_level": m.trust_level,
+                "source_attribution": m.source_attribution,
+            }
+            for m in result.memories
+        ]
+        return {"memories": memories, "count": len(memories), "query": query}
+
+    def _handle_recall_recent(self, args: dict) -> dict:
+        limit = min(int(args.get("limit", 5)), 20)
+        memory_types = args.get("memory_types")
+        by_access = bool(args.get("by_access", True))
+
+        # API exposes recent by created_at; "by_access" isn't supported, so we approximate by created_at.
+        # If a type filter is provided, use the first type.
+        mt = None
+        if isinstance(memory_types, list) and memory_types:
+            mt = ApiMemoryType(str(memory_types[0]))
+
+        rows = self.client.recall_recent(limit=limit, memory_type=mt)
+        if by_access:
+            # Touch to keep access_count semantics similar.
+            self.client.touch_memories([m.id for m in rows])
+        results = [
+            {
+                "memory_id": str(m.id),
+                "content": m.content,
+                "memory_type": m.type.value,
+                "importance": m.importance,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "last_accessed": None,
+                "trust_level": m.trust_level,
+                "source_attribution": m.source_attribution,
+            }
+            for m in rows
+        ]
+        return {"memories": results, "count": len(results)}
+
+    def _handle_explore_concept(self, args: dict) -> dict:
+        concept = str(args.get("concept", "")).strip()
+        include_related = bool(args.get("include_related", True))
+        limit = min(int(args.get("limit", 5)), 20)
+        if not concept:
+            return {"error": "Missing concept"}
+
+        direct = self.client.find_by_concept(concept, limit=limit)
+        combined: dict[str, dict] = {
+            str(m.id): {
+                "memory_id": str(m.id),
+                "content": m.content,
+                "memory_type": m.type.value,
+                "importance": m.importance,
+                "trust_level": m.trust_level,
+                "source_attribution": m.source_attribution,
+                "source": "concept",
+                "score": None,
+            }
+            for m in direct
+        }
+        if include_related:
+            rr = self.client.recall(concept, limit=limit, include_partial=False)
+            for m in rr.memories:
+                combined.setdefault(
+                    str(m.id),
+                    {
+                        "memory_id": str(m.id),
+                        "content": m.content,
+                        "memory_type": m.type.value,
+                        "importance": m.importance,
+                        "trust_level": m.trust_level,
+                        "source_attribution": m.source_attribution,
+                        "source": m.source,
+                        "score": m.similarity,
+                    },
+                )
+
+        out = list(combined.values())[:limit]
+        return {"concept": concept, "memories": out, "count": len(out)}
+
+    def _handle_get_procedures(self, args: dict) -> dict:
+        task = str(args.get("task", "")).strip()
+        limit = min(int(args.get("limit", 3)), 10)
+        if not task:
+            return {"procedures": [], "count": 0, "task": task}
+        res = self.client.recall(task, limit=limit, memory_types=[ApiMemoryType.PROCEDURAL], include_partial=False)
+        return {"procedures": [{"memory_id": str(m.id), "content": m.content, "score": m.similarity} for m in res.memories], "count": len(res.memories), "task": task}
+
+    def _handle_get_strategies(self, args: dict) -> dict:
+        situation = str(args.get("situation", "")).strip()
+        limit = min(int(args.get("limit", 3)), 10)
+        if not situation:
+            return {"strategies": [], "count": 0, "situation": situation}
+        res = self.client.recall(situation, limit=limit, memory_types=[ApiMemoryType.STRATEGIC], include_partial=False)
+        return {"strategies": [{"memory_id": str(m.id), "content": m.content, "score": m.similarity} for m in res.memories], "count": len(res.memories), "situation": situation}
+
+    def _handle_create_goal(self, args: dict) -> dict:
+        title = str(args.get("title", "")).strip()
+        if not title:
+            return {"error": "Missing title"}
+
+        description = args.get("description")
+        priority = str(args.get("priority") or ApiGoalPriority.QUEUED.value)
+        source = str(args.get("source") or ApiGoalSource.USER_REQUEST.value)
+        due_at_raw = args.get("due_at")
+
+        due_at = None
+        if isinstance(due_at_raw, str) and due_at_raw.strip():
+            txt = due_at_raw.strip()
+            if txt.endswith("Z"):
+                txt = txt[:-1] + "+00:00"
+            try:
+                due_at = datetime.fromisoformat(txt)
+            except Exception:
+                due_at = None
+
+        goal_id = self.client.create_goal(
+            title,
+            description=str(description) if isinstance(description, str) else None,
+            source=source,
+            priority=priority,
+            due_at=due_at,
+        )
+        return {"goal_id": str(goal_id), "title": title, "priority": priority, "source": source, "due_at": due_at_raw}
+
+    def _handle_queue_user_message(self, args: dict) -> dict:
+        message = str(args.get("message", "")).strip()
+        if not message:
+            return {"error": "Missing message"}
+
+        intent = args.get("intent")
+        context = args.get("context")
+        outbox_id = self.client.queue_user_message(
+            message,
+            intent=str(intent) if isinstance(intent, str) else None,
+            context=context if isinstance(context, dict) else None,
+        )
+        return {"outbox_id": str(outbox_id), "queued": True}
+
+
 # ============================================================================
 # CONTEXT ENRICHMENT
 # ============================================================================
@@ -635,18 +903,18 @@ class ContextEnricher:
     def __init__(self, db_config: dict, top_k: int = 5):
         self.db_config = db_config
         self.top_k = top_k
-        self.conn = None
+        self.client: CognitiveMemorySync | None = None
     
     def connect(self):
-        """Establish database connection."""
-        if not self.conn or self.conn.closed:
-            self.conn = psycopg2.connect(
-                host=self.db_config.get('host', 'localhost'),
-                port=self.db_config.get('port', 5432),
-                dbname=self.db_config.get('dbname', 'agi_memory'),
-                user=self.db_config.get('user', 'postgres'),
-                password=self.db_config.get('password', 'password')
-            )
+        """Establish DB connection via CognitiveMemorySync."""
+        if self.client is not None:
+            return
+        dsn = (
+            f"postgresql://{self.db_config.get('user', 'postgres')}:{self.db_config.get('password', 'password')}"
+            f"@{self.db_config.get('host', 'localhost')}:{int(self.db_config.get('port', 5432))}"
+            f"/{self.db_config.get('dbname', 'agi_memory')}"
+        )
+        self.client = CognitiveMemorySync.connect(dsn, min_size=1, max_size=5)
     
     def enrich(self, user_message: str) -> dict:
         """
@@ -660,29 +928,23 @@ class ContextEnricher:
             }
         """
         self.connect()
-        
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Use fast_recall to get relevant memories
-            cur.execute("""
-                SELECT 
-                    memory_id,
-                    content,
-                    memory_type,
-                    score,
-                    source
-                FROM fast_recall(%s, %s)
-            """, (user_message, self.top_k))
-            
-            memories = cur.fetchall()
-            
-            # Update access counts
-            if memories:
-                cur.execute("""
-                    UPDATE memories 
-                    SET access_count = access_count + 1, last_accessed = CURRENT_TIMESTAMP
-                    WHERE id = ANY(%s)
-                """, ([m['memory_id'] for m in memories],))
-                self.conn.commit()
+
+        assert self.client is not None
+        result = self.client.recall(user_message, limit=self.top_k, include_partial=False)
+        memories = [
+            {
+                "memory_id": str(m.id),
+                "content": m.content,
+                "memory_type": m.type.value,
+                "score": m.similarity,
+                "source": m.source,
+                "importance": m.importance,
+                "trust_level": m.trust_level,
+                "source_attribution": m.source_attribution,
+            }
+            for m in result.memories
+        ]
+        self.client.touch_memories([m.id for m in result.memories])
         
         # Format memories into context
         if memories:
@@ -714,8 +976,9 @@ class ContextEnricher:
     
     def close(self):
         """Close database connection."""
-        if self.conn:
-            self.conn.close()
+        if self.client is not None:
+            self.client.close()
+            self.client = None
 
 
 # ============================================================================
@@ -731,40 +994,25 @@ class MemoryFormation:
     def __init__(self, db_config: dict, llm_client=None):
         self.db_config = db_config
         self.llm_client = llm_client
-        self.conn = None
+        self.client: CognitiveMemorySync | None = None
     
     def connect(self):
-        """Establish database connection."""
-        if not self.conn or self.conn.closed:
-            self.conn = psycopg2.connect(
-                host=self.db_config.get('host', 'localhost'),
-                port=self.db_config.get('port', 5432),
-                dbname=self.db_config.get('dbname', 'agi_memory'),
-                user=self.db_config.get('user', 'postgres'),
-                password=self.db_config.get('password', 'password')
-            )
+        """Establish DB connection via CognitiveMemorySync."""
+        if self.client is not None:
+            return
+        dsn = (
+            f"postgresql://{self.db_config.get('user', 'postgres')}:{self.db_config.get('password', 'password')}"
+            f"@{self.db_config.get('host', 'localhost')}:{int(self.db_config.get('port', 5432))}"
+            f"/{self.db_config.get('dbname', 'agi_memory')}"
+        )
+        self.client = CognitiveMemorySync.connect(dsn, min_size=1, max_size=5)
     
     def should_form_memory(self, user_message: str, assistant_response: str) -> bool:
         """
         Determine if this exchange should be stored as a memory.
-        Simple heuristics for now - could use LLM for more nuanced decisions.
+        Conversation turns are always worth recording as episodic memory; importance is graded in form_memory().
         """
-        # Always store if long exchange
-        if len(user_message) > 200 or len(assistant_response) > 500:
-            return True
-        
-        # Store if contains learning indicators
-        learning_signals = [
-            'remember', 'don\'t forget', 'important', 'note that',
-            'my name is', 'i prefer', 'i like', 'i don\'t like',
-            'always', 'never', 'make sure', 'keep in mind'
-        ]
-        
-        combined = (user_message + assistant_response).lower()
-        if any(signal in combined for signal in learning_signals):
-            return True
-        
-        return False
+        return True
     
     def form_memory(
         self, 
@@ -779,54 +1027,65 @@ class MemoryFormation:
         Returns the memory ID if successful.
         """
         self.connect()
+        assert self.client is not None
         
         # Create a combined memory content
         content = f"User: {user_message}\n\nAssistant: {assistant_response}"
-        
-        with self.conn.cursor() as cur:
-            try:
-                if memory_type == 'episodic':
-                    cur.execute("""
-                        SELECT create_episodic_memory(
-                            %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s
-                        )
-                    """, (
-                        content,
-                        None,  # action_taken
-                        json.dumps({"type": "conversation"}),
-                        None,  # result
-                        0.0,   # neutral emotional valence
-                        importance
-                    ))
-                else:
-                    cur.execute("""
-                        SELECT create_semantic_memory(
-                            %s, %s, %s, %s, %s, %s
-                        )
-                    """, (
-                        content,
-                        0.8,   # confidence
-                        None,  # category
-                        None,  # related_concepts
-                        json.dumps({"type": "conversation"}),
-                        importance
-                    ))
-                
-                result = cur.fetchone()
-                memory_id = str(result[0]) if result else None
-                
-                self.conn.commit()
-                return memory_id
-                
-            except Exception as e:
-                self.conn.rollback()
-                print(f"Error forming memory: {e}")
-                return None
+
+        combined = (user_message + "\n" + assistant_response).lower()
+        learning_signals = [
+            "remember",
+            "don't forget",
+            "important",
+            "note that",
+            "my name is",
+            "i prefer",
+            "i like",
+            "i don't like",
+            "always",
+            "never",
+            "make sure",
+            "keep in mind",
+        ]
+        if len(user_message) > 200 or len(assistant_response) > 500:
+            importance = max(importance, 0.7)
+        if any(signal in combined for signal in learning_signals):
+            importance = max(importance, 0.8)
+        importance = max(0.15, min(float(importance), 1.0))
+
+        source_attribution = {
+            "kind": "conversation",
+            "ref": "conversation_turn",
+            "label": "conversation turn",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "trust": 0.95,
+        }
+        trust_level = 0.95
+
+        if memory_type == "semantic":
+            mt = ApiMemoryType.SEMANTIC
+            source_references: Any = [source_attribution]
+        else:
+            mt = ApiMemoryType.EPISODIC
+            source_references = None
+
+        mem_id = self.client.remember(
+            content,
+            type=mt,
+            importance=float(importance),
+            emotional_valence=0.0,
+            context={"type": "conversation"},
+            source_attribution=source_attribution,
+            source_references=source_references,
+            trust_level=trust_level if mt == ApiMemoryType.EPISODIC else None,
+        )
+        return str(mem_id) if mem_id else None
     
     def close(self):
         """Close database connection."""
-        if self.conn:
-            self.conn.close()
+        if self.client is not None:
+            self.client.close()
+            self.client = None
 
 
 # ============================================================================
@@ -834,13 +1093,13 @@ class MemoryFormation:
 # ============================================================================
 
 def get_tool_definitions() -> list:
-    """Return the tool definitions for function calling."""
-    return MEMORY_TOOLS
+    """Return tool definitions for function calling (conversation loop)."""
+    return [t for t in MEMORY_TOOLS if t.get("function", {}).get("name") in _API_TOOL_NAMES]
 
 
 def create_tool_handler(db_config: dict) -> MemoryToolHandler:
-    """Create a tool handler instance."""
-    return MemoryToolHandler(db_config)
+    """Create a tool handler instance (API-backed by default)."""
+    return ApiMemoryToolHandler(db_config)
 
 
 def create_enricher(db_config: dict, top_k: int = 5) -> ContextEnricher:

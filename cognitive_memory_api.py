@@ -36,6 +36,13 @@ class GoalPriority(str, Enum):
     COMPLETED = "completed"
     ABANDONED = "abandoned"
 
+class GoalSource(str, Enum):
+    CURIOSITY = "curiosity"
+    USER_REQUEST = "user_request"
+    IDENTITY = "identity"
+    DERIVED = "derived"
+    EXTERNAL = "external"
+
 
 class RelationshipType(str, Enum):
     TEMPORAL_NEXT = "TEMPORAL_NEXT"
@@ -122,6 +129,15 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
         await conn.execute("SET search_path = ag_catalog, public;")
     except Exception:
         pass
+
+def _to_jsonb_arg(val: Any) -> Any:
+    if val is None:
+        return None
+    if isinstance(val, (dict, list)):
+        import json
+
+        return json.dumps(val)
+    return val
 
 
 def _cypher_escape(value: str) -> str:
@@ -386,7 +402,7 @@ class CognitiveMemory:
             await conn.execute(
                 "SELECT add_semantic_source_reference($1::uuid, $2::jsonb)",
                 memory_id,
-                source,
+                _to_jsonb_arg(source),
             )
 
     async def get_truth_profile(self, memory_id: UUID) -> dict[str, Any]:
@@ -399,23 +415,36 @@ class CognitiveMemory:
 
     async def remember_batch(self, memories: Iterable[MemoryInput]) -> list[UUID]:
         async with self._pool.acquire() as conn:
-            ids: list[UUID] = []
-            for m in memories:
-                mid = await self._create_memory(
-                    conn,
-                    m.content,
-                    m.type,
-                    m.importance,
-                    m.emotional_valence,
-                    m.context,
-                    source_attribution=m.source_attribution,
-                    source_references=m.source_references,
-                    trust_level=m.trust_level,
-                )
+            items: list[dict[str, Any]] = []
+            mem_list = list(memories)
+            for m in mem_list:
+                item: dict[str, Any] = {"type": m.type.value, "content": m.content, "importance": m.importance}
+                if m.source_attribution is not None:
+                    item["source_attribution"] = m.source_attribution
+                if m.trust_level is not None:
+                    item["trust_level"] = m.trust_level
+                if m.type == MemoryType.EPISODIC:
+                    item["context"] = m.context
+                    item["emotional_valence"] = m.emotional_valence
+                elif m.type == MemoryType.SEMANTIC:
+                    item["source_references"] = m.source_references if m.source_references is not None else m.context
+                elif m.type == MemoryType.PROCEDURAL:
+                    item["steps"] = m.context if m.context is not None else {"steps": []}
+                elif m.type == MemoryType.STRATEGIC:
+                    item["supporting_evidence"] = m.context
+                items.append(item)
+
+            import json
+
+            created = await conn.fetchval("SELECT batch_create_memories($1::jsonb)", json.dumps(items))
+            ids = list(created or [])
+
+            # Link concepts (still per-memory).
+            for mid, m in zip(ids, mem_list):
                 if m.concepts:
                     for concept in m.concepts:
                         await conn.fetchval("SELECT link_memory_to_concept($1::uuid, $2::text, 1.0)", mid, concept)
-                ids.append(mid)
+
             return ids
 
     async def remember_batch_raw(
@@ -437,43 +466,47 @@ class CognitiveMemory:
             raise ValueError("contents and embeddings must have same length")
 
         async with self._pool.acquire() as conn:
-            # Ensure AGE is available for graph node creation.
-            await _init_connection(conn)
-
             expected_dim = int(await conn.fetchval("SELECT embedding_dimension()"))
-            ids: list[UUID] = []
-            for content, embedding in zip(contents, embeddings):
+            for embedding in embeddings:
                 if len(embedding) != expected_dim:
                     raise ValueError(f"embedding dimension mismatch: expected {expected_dim}, got {len(embedding)}")
 
-                memory_id = await conn.fetchval(
-                    """
-                    INSERT INTO memories (type, content, embedding, importance)
-                    VALUES ($1::memory_type, $2::text, ($3::float4[])::vector, $4::float)
-                    RETURNING id
-                    """,
-                    type.value,
-                    content,
-                    embedding,
-                    importance,
+            created = await conn.fetchval(
+                """
+                SELECT batch_create_memories_with_embeddings(
+                    $1::memory_type,
+                    $2::text[],
+                    $3::jsonb,
+                    $4::float
                 )
+                """,
+                type.value,
+                contents,
+                _to_jsonb_arg(embeddings),
+                float(importance),
+            )
+            return list(created or [])
 
-                # AGE's cypher() expects a cstring query; passing a parameter requires casting to cstring.
-                created_at = datetime.now(timezone.utc).isoformat()
-                query = (
-                    "CREATE (n:MemoryNode {"
-                    f"memory_id: '{_cypher_escape(str(memory_id))}', "
-                    f"type: '{_cypher_escape(type.value)}', "
-                    f"created_at: '{_cypher_escape(created_at)}'"
-                    "}) RETURN n"
-                )
-                # AGE requires the query argument to be a literal; parameterizing can fail.
-                await conn.execute(
-                    f"SELECT * FROM cypher('memory_graph', $$ {query} $$) as (result agtype)"
-                )
-
-                ids.append(memory_id)
-            return ids
+    async def touch_memories(self, memory_ids: Iterable[UUID]) -> int:
+        """Increment access_count/last_accessed for the given memory ids."""
+        ids = list(memory_ids)
+        if not ids:
+            return 0
+        async with self._pool.acquire() as conn:
+            n = await conn.execute(
+                """
+                UPDATE memories
+                SET access_count = access_count + 1,
+                    last_accessed = CURRENT_TIMESTAMP
+                WHERE id = ANY($1::uuid[])
+                """,
+                ids,
+            )
+            # asyncpg returns "UPDATE <count>"
+            try:
+                return int(str(n).split()[-1])
+            except Exception:
+                return 0
 
     # =========================================================================
     # GRAPH / RELATIONSHIPS
@@ -634,6 +667,78 @@ class CognitiveMemory:
                 )
             return [dict(row) for row in rows]
 
+    async def create_goal(
+        self,
+        title: str,
+        *,
+        description: str | None = None,
+        source: GoalSource | str = GoalSource.USER_REQUEST,
+        priority: GoalPriority | str = GoalPriority.QUEUED,
+        parent_id: UUID | None = None,
+        due_at: datetime | None = None,
+    ) -> UUID:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                SELECT create_goal(
+                    $1,
+                    $2,
+                    $3::goal_source,
+                    $4::goal_priority,
+                    $5::uuid,
+                    $6::timestamptz
+                )
+                """,
+                title,
+                description,
+                (source.value if isinstance(source, GoalSource) else str(source)),
+                (priority.value if isinstance(priority, GoalPriority) else str(priority)),
+                parent_id,
+                due_at,
+            )
+
+    async def queue_user_message(
+        self,
+        message: str,
+        *,
+        intent: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> UUID:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT queue_user_message($1, $2, $3::jsonb)",
+                message,
+                intent,
+                _to_jsonb_arg(context or {}),
+            )
+
+    async def get_ingestion_receipts(self, source_file: str, content_hashes: list[str]) -> dict[str, UUID]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM get_ingestion_receipts($1::text, $2::text[])",
+                source_file,
+                content_hashes,
+            )
+            out: dict[str, UUID] = {}
+            for r in rows:
+                try:
+                    out[str(r["content_hash"])] = UUID(str(r["memory_id"]))
+                except Exception:
+                    continue
+            return out
+
+    async def record_ingestion_receipts(self, items: list[dict[str, Any]]) -> int:
+        async with self._pool.acquire() as conn:
+            import json
+
+            return int(
+                await conn.fetchval(
+                    "SELECT record_ingestion_receipts($1::jsonb)",
+                    json.dumps(items),
+                )
+                or 0
+            )
+
     # =========================================================================
     # INTERNALS
     # =========================================================================
@@ -655,10 +760,10 @@ class CognitiveMemory:
             return await conn.fetchval(
                 "SELECT create_episodic_memory($1::text, NULL, $2::jsonb, NULL, $3::float, CURRENT_TIMESTAMP, $4::float, $5::jsonb, $6::float)",
                 content,
-                context,
+                _to_jsonb_arg(context),
                 emotional_valence,
                 importance,
-                source_attribution,
+                _to_jsonb_arg(source_attribution),
                 trust_level,
             )
         if type == MemoryType.SEMANTIC:
@@ -666,9 +771,9 @@ class CognitiveMemory:
             return await conn.fetchval(
                 "SELECT create_semantic_memory($1::text, 0.8::float, NULL, NULL, $2::jsonb, $3::float, $4::jsonb, $5::float)",
                 content,
-                sources,
+                _to_jsonb_arg(sources),
                 importance,
-                source_attribution,
+                _to_jsonb_arg(source_attribution),
                 trust_level,
             )
         if type == MemoryType.PROCEDURAL:
@@ -676,9 +781,9 @@ class CognitiveMemory:
             return await conn.fetchval(
                 "SELECT create_procedural_memory($1::text, $2::jsonb, NULL, $3::float, $4::jsonb, $5::float)",
                 content,
-                steps,
+                _to_jsonb_arg(steps),
                 importance,
-                source_attribution,
+                _to_jsonb_arg(source_attribution),
                 trust_level,
             )
         if type == MemoryType.STRATEGIC:
@@ -686,9 +791,9 @@ class CognitiveMemory:
                 "SELECT create_strategic_memory($1::text, $2::text, 0.8::float, $3::jsonb, NULL, $4::float, $5::jsonb, $6::float)",
                 content,
                 content,
-                context,
+                _to_jsonb_arg(context),
                 importance,
-                source_attribution,
+                _to_jsonb_arg(source_attribution),
                 trust_level,
             )
         raise ValueError(f"Unknown memory type: {type}")
@@ -806,8 +911,47 @@ class CognitiveMemorySync:
     def remember(self, content: str, **kwargs: Any) -> UUID:
         return self._loop.run_until_complete(self._async.remember(content, **kwargs))
 
+    def remember_batch(self, memories: Iterable[MemoryInput]) -> list[UUID]:
+        return self._loop.run_until_complete(self._async.remember_batch(memories))
+
+    def remember_batch_raw(self, contents: list[str], embeddings: list[list[float]], **kwargs: Any) -> list[UUID]:
+        return self._loop.run_until_complete(self._async.remember_batch_raw(contents, embeddings, **kwargs))
+
     def connect_memories(self, from_id: UUID, to_id: UUID, relationship: RelationshipType, **kwargs: Any) -> None:
         return self._loop.run_until_complete(self._async.connect_memories(from_id, to_id, relationship, **kwargs))
+
+    def touch_memories(self, memory_ids: Iterable[UUID]) -> int:
+        return self._loop.run_until_complete(self._async.touch_memories(memory_ids))
+
+    def create_goal(
+        self,
+        title: str,
+        *,
+        description: str | None = None,
+        source: GoalSource | str = GoalSource.USER_REQUEST,
+        priority: GoalPriority | str = GoalPriority.QUEUED,
+        parent_id: UUID | None = None,
+        due_at: datetime | None = None,
+    ) -> UUID:
+        return self._loop.run_until_complete(
+            self._async.create_goal(
+                title,
+                description=description,
+                source=source,
+                priority=priority,
+                parent_id=parent_id,
+                due_at=due_at,
+            )
+        )
+
+    def queue_user_message(self, message: str, *, intent: str | None = None, context: dict[str, Any] | None = None) -> UUID:
+        return self._loop.run_until_complete(self._async.queue_user_message(message, intent=intent, context=context))
+
+    def get_ingestion_receipts(self, source_file: str, content_hashes: list[str]) -> dict[str, UUID]:
+        return self._loop.run_until_complete(self._async.get_ingestion_receipts(source_file, content_hashes))
+
+    def record_ingestion_receipts(self, items: list[dict[str, Any]]) -> int:
+        return self._loop.run_until_complete(self._async.record_ingestion_receipts(items))
 
 
 def format_context_for_prompt(context: HydratedContext, *, max_memories: int = 5, max_partials: int = 3) -> str:

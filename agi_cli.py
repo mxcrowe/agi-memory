@@ -162,6 +162,12 @@ async def _status_payload(
         payload["agent_configured"] = bool(await conn.fetchval("SELECT is_agent_configured()"))
         payload["heartbeat_paused"] = bool(await conn.fetchval("SELECT is_paused FROM heartbeat_state WHERE id = 1"))
         payload["should_run_heartbeat"] = bool(await conn.fetchval("SELECT should_run_heartbeat()"))
+        try:
+            payload["maintenance_paused"] = bool(await conn.fetchval("SELECT is_paused FROM maintenance_state WHERE id = 1"))
+            payload["should_run_maintenance"] = bool(await conn.fetchval("SELECT should_run_maintenance()"))
+        except Exception:
+            payload["maintenance_paused"] = None
+            payload["should_run_maintenance"] = None
 
         payload["pending_external_calls"] = int(
             await conn.fetchval(
@@ -343,7 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to ingest.py")
     ingest.set_defaults(func="ingest")
 
-    worker = sub.add_parser("worker", help="Run the heartbeat worker (forwards args to worker.py)")
+    worker = sub.add_parser("worker", help="Run background workers (forwards args to worker.py)")
     worker.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to worker.py")
     worker.set_defaults(func="worker")
 
@@ -355,10 +361,10 @@ def build_parser() -> argparse.ArgumentParser:
     mcp.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to agi_mcp_server.py")
     mcp.set_defaults(func="mcp")
 
-    start = sub.add_parser("start", help="Start the worker (active profile)")
+    start = sub.add_parser("start", help="Start workers (active profile)")
     start.set_defaults(func="start")
 
-    stop = sub.add_parser("stop", help="Stop the worker (container remains)")
+    stop = sub.add_parser("stop", help="Stop workers (containers remain)")
     stop.set_defaults(func="stop")
 
     status = sub.add_parser("status", help="Show system status (db/config/queue)")
@@ -441,9 +447,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.func == "mcp":
         return _run_module("agi_mcp_server", args.args)
     if args.func == "start":
-        return run_compose(compose_cmd or [], stack_dir, ["--profile", "active", "up", "-d", "worker"], env_file)
+        return run_compose(
+            compose_cmd or [],
+            stack_dir,
+            ["--profile", "active", "up", "-d", "heartbeat_worker", "maintenance_worker"],
+            env_file,
+        )
     if args.func == "stop":
-        return run_compose(compose_cmd or [], stack_dir, ["stop", "worker"], env_file)
+        return run_compose(compose_cmd or [], stack_dir, ["stop", "heartbeat_worker", "maintenance_worker"], env_file)
     if args.func == "status":
         dsn = args.dsn or _env_dsn()
         payload = asyncio.run(_status_payload(dsn, wait_seconds=args.wait_seconds))
@@ -465,6 +476,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"Agent configured: {payload.get('agent_configured')}",
                 f"Heartbeat paused: {payload.get('heartbeat_paused')}",
                 f"Should run heartbeat: {payload.get('should_run_heartbeat')}",
+                f"Maintenance paused: {payload.get('maintenance_paused')}",
+                f"Should run maintenance: {payload.get('should_run_maintenance')}",
                 f"Embedding URL: {payload.get('embedding_service_url')}",
                 f"Embedding healthy: {payload.get('embedding_service_healthy')}",
                 f"Pending external_calls: {payload.get('pending_external_calls')}",

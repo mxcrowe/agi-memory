@@ -30,15 +30,9 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "--break-system-packages", "-q"])
     import requests
 
-try:
-    import psycopg2
-    from psycopg2.extras import Json
-except ImportError:
-    print("Installing psycopg2-binary...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "psycopg2-binary", "--break-system-packages", "-q"])
-    import psycopg2
-    from psycopg2.extras import Json
+from datetime import datetime, timezone
+
+from cognitive_memory_api import CognitiveMemorySync, MemoryInput as ApiMemoryInput, MemoryType as ApiMemoryType
 
 
 # ============================================================================
@@ -597,124 +591,122 @@ class MemoryExtractor:
 # ============================================================================
 
 class MemoryStore:
-    """Stores extracted memories in the PostgreSQL database."""
+    """Stores extracted memories in Postgres via the core CognitiveMemory API."""
     
     def __init__(self, config: Config):
         self.config = config
-        self.conn = None
+        self.client: CognitiveMemorySync | None = None
     
     def connect(self):
-        """Connect to the database."""
-        self.conn = psycopg2.connect(
-            host=self.config.db_host,
-            port=self.config.db_port,
-            dbname=self.config.db_name,
-            user=self.config.db_user,
-            password=self.config.db_password
+        """Connect to the database (sync wrapper around asyncpg pool)."""
+        if self.client is not None:
+            return
+        dsn = (
+            f"postgresql://{self.config.db_user}:{self.config.db_password}"
+            f"@{self.config.db_host}:{self.config.db_port}/{self.config.db_name}"
         )
-        self.conn.autocommit = False
+        self.client = CognitiveMemorySync.connect(dsn, min_size=1, max_size=5)
     
     def close(self):
         """Close the database connection."""
-        if self.conn:
-            self.conn.close()
+        if self.client is not None:
+            self.client.close()
+            self.client = None
     
     def store_memory(self, memory: ExtractedMemory) -> Optional[str]:
-        """Store a memory in the database and return its ID."""
-        if not self.conn:
+        ids = self.store_memories([memory])
+        return str(ids[0]) if ids else None
+
+    def store_memories(self, memories: list[ExtractedMemory]) -> list[str]:
+        """Store a batch of extracted memories and return their IDs."""
+        if not memories:
+            return []
+        if self.client is None:
             self.connect()
-        
-        cursor = self.conn.cursor()
-        
+        assert self.client is not None
+
+        now = datetime.now(timezone.utc).isoformat()
+        items: list[tuple[ExtractedMemory, str]] = []
+        for m in memories:
+            h = hashlib.sha256(f"{m.memory_type.value}\n{m.content}".encode("utf-8")).hexdigest()
+            items.append((m, h))
+
+        # Idempotency: skip already-ingested (source_file + content_hash).
+        existing: dict[tuple[str, str], str] = {}
+        by_source: dict[str, list[str]] = {}
+        for m, h in items:
+            by_source.setdefault(m.source_file, []).append(h)
+        for src, hashes in by_source.items():
+            try:
+                receipts = self.client.get_ingestion_receipts(src, hashes)
+            except Exception:
+                receipts = {}
+            for hh, mid in receipts.items():
+                existing[(src, hh)] = str(mid)
+
+        inputs: list[ApiMemoryInput] = []
+        receipt_rows: list[dict] = []
+        for m, h in items:
+            if (m.source_file, h) in existing:
+                continue
+            api_type = ApiMemoryType(m.memory_type.value)
+            source_ref = {
+                "kind": "document",
+                "ref": m.source_file,
+                "label": f"{Path(m.source_file).name}#chunk{m.source_chunk}",
+                "observed_at": now,
+                "trust": 0.7,
+                "content_hash": h,
+            }
+
+            context: Optional[dict] = None
+            if api_type == ApiMemoryType.EPISODIC:
+                context = {
+                    "type": "ingest",
+                    "source_file": m.source_file,
+                    "source_chunk": m.source_chunk,
+                    "extracted": m.context or {},
+                }
+            elif api_type == ApiMemoryType.PROCEDURAL:
+                context = {"steps": m.steps or []}
+            elif api_type == ApiMemoryType.STRATEGIC:
+                context = {"pattern_description": m.pattern_description, "context_applicability": m.context_applicability}
+
+            inputs.append(
+                ApiMemoryInput(
+                    content=m.content,
+                    type=api_type,
+                    importance=m.importance,
+                    emotional_valence=float(m.emotional_valence or 0.0),
+                    context=context,
+                    concepts=[str(c).strip().lower() for c in (m.concepts or []) if str(c).strip()],
+                    source_attribution=source_ref,
+                    source_references=[source_ref] if api_type == ApiMemoryType.SEMANTIC else None,
+                )
+            )
+            receipt_rows.append({"source_file": m.source_file, "chunk_index": int(m.source_chunk), "content_hash": h})
+
+        if not inputs:
+            return []
+
+        ids = self.client.remember_batch(inputs)
+        created = [str(i) for i in ids]
+
+        # Record receipts best-effort; failures should not fail ingestion after commit.
         try:
-            memory_type = memory.memory_type.value
-            
-            # Use the appropriate creation function based on type
-            if memory_type == "episodic":
-                cursor.execute("""
-                    SELECT create_episodic_memory(
-                        %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s
-                    )
-                """, (
-                    memory.content,
-                    Json({"action": "ingested"}) if memory.context else None,
-                    Json(memory.context) if memory.context else None,
-                    Json({"source": memory.source_file}),
-                    memory.emotional_valence or 0.0,
-                    memory.importance
-                ))
-            
-            elif memory_type == "semantic":
-                cursor.execute("""
-                    SELECT create_semantic_memory(
-                        %s, %s, %s, %s, %s, %s
-                    )
-                """, (
-                    memory.content,
-                    memory.confidence or 0.8,
-                    memory.category,
-                    memory.related_concepts,
-                    Json({"source": memory.source_file, "chunk": memory.source_chunk}),
-                    memory.importance
-                ))
-            
-            elif memory_type == "procedural":
-                cursor.execute("""
-                    SELECT create_procedural_memory(
-                        %s, %s, %s, %s
-                    )
-                """, (
-                    memory.content,
-                    Json(memory.steps) if memory.steps else Json([]),
-                    Json(memory.prerequisites) if memory.prerequisites else None,
-                    memory.importance
-                ))
-            
-            elif memory_type == "strategic":
-                cursor.execute("""
-                    SELECT create_strategic_memory(
-                        %s, %s, %s, %s, %s, %s
-                    )
-                """, (
-                    memory.content,
-                    memory.pattern_description or memory.content[:200],
-                    memory.importance,  # Use importance as confidence
-                    Json({"source": memory.source_file}),
-                    Json(memory.context_applicability) if memory.context_applicability else None,
-                    memory.importance
-                ))
-            
-            result = cursor.fetchone()
-            memory_id = str(result[0]) if result else None
-            
-            # Link concepts
-            if memory_id and memory.concepts:
-                for concept in memory.concepts:
-                    try:
-                        cursor.execute("""
-                            SELECT link_memory_to_concept(%s::uuid, %s, 1.0)
-                        """, (memory_id, concept.lower().strip()))
-                    except Exception as e:
-                        if self.config.verbose:
-                            print(f"    Warning: Failed to link concept '{concept}': {e}")
-            
-            return memory_id
-            
-        except Exception as e:
-            if self.config.verbose:
-                print(f"  Error storing memory: {e}")
-            self.conn.rollback()
-            return None
+            for row, mid in zip(receipt_rows, created):
+                row["memory_id"] = mid
+            self.client.record_ingestion_receipts(receipt_rows)
+        except Exception:
+            pass
+
+        return created
     
     def commit(self):
-        """Commit the current transaction."""
-        if self.conn:
-            self.conn.commit()
+        """Compatibility no-op (writes are committed per statement in asyncpg)."""
     
     def rollback(self):
-        """Rollback the current transaction."""
-        if self.conn:
-            self.conn.rollback()
+        """Compatibility no-op (writes are committed per statement in asyncpg)."""
 
 
 # ============================================================================
@@ -793,13 +785,19 @@ class IngestionPipeline:
             if self.config.verbose:
                 print(f"extracted {len(memories)} memories")
             
-            # Store memories
-            for memory in memories:
-                memory_id = self.store.store_memory(memory)
-                if memory_id:
-                    memories_created += 1
-                    if self.config.verbose:
-                        print(f"    + [{memory.memory_type.value}] {memory.content[:60]}...")
+            # Store memories (batched for fewer DB round-trips)
+            try:
+                created_ids = self.store.store_memories(memories)
+            except Exception as e:
+                self.stats["errors"] += 1
+                if self.config.verbose:
+                    print(f"    Error storing batch: {e}")
+                created_ids = []
+
+            memories_created += len(created_ids)
+            if self.config.verbose:
+                for memory, memory_id in zip(memories, created_ids):
+                    print(f"    + [{memory.memory_type.value}] {memory.content[:60]}... ({memory_id[:8]}...)")
             
             self.stats['chunks_processed'] += 1
             

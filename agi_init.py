@@ -138,6 +138,10 @@ async def _get_heartbeat_config(conn: asyncpg.Connection) -> dict[str, float]:
     rows = await conn.fetch("SELECT key, value FROM heartbeat_config")
     return {r["key"]: float(r["value"]) for r in rows}
 
+async def _get_maintenance_config(conn: asyncpg.Connection) -> dict[str, float]:
+    rows = await conn.fetch("SELECT key, value FROM maintenance_config")
+    return {r["key"]: float(r["value"]) for r in rows}
+
 
 async def _set_config(conn: asyncpg.Connection, key: str, value: Any) -> None:
     await conn.execute("SELECT set_config($1, $2::jsonb)", key, json.dumps(value))
@@ -149,15 +153,26 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
         await _ensure_schema_has_config(conn)
 
         hb = await _get_heartbeat_config(conn)
+        maint = {}
+        try:
+            maint = await _get_maintenance_config(conn)
+        except Exception:
+            maint = {}
         default_interval = int(hb.get("heartbeat_interval_minutes", 60))
         default_max_energy = float(hb.get("max_energy", 20))
         default_regen = float(hb.get("base_regeneration", 10))
         default_max_active_goals = int(hb.get("max_active_goals", 3))
+        default_maint_interval = int(maint.get("maintenance_interval_seconds", 60)) if maint else 60
 
         print("AGI init: configure heartbeat + objectives + guardrails.\n")
 
         heartbeat_interval = _prompt_int(
             "Heartbeat interval (minutes)", default=default_interval, min_value=1
+        )
+        maintenance_interval = _prompt_int(
+            "Subconscious maintenance interval (seconds)",
+            default=default_maint_interval,
+            min_value=1,
         )
         max_energy = _prompt_float("Max energy budget", default=default_max_energy, min_value=0.0)
         base_regeneration = _prompt_float(
@@ -220,6 +235,7 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
         )
 
         enable_autonomy = _prompt_yes_no("Enable autonomous heartbeats now?", default=True)
+        enable_maintenance = _prompt_yes_no("Enable subconscious maintenance now?", default=True)
 
         async with conn.transaction():
             await conn.execute(
@@ -237,6 +253,13 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
                 "UPDATE heartbeat_config SET value = $1 WHERE key = 'max_active_goals'",
                 float(max_active_goals),
             )
+            try:
+                await conn.execute(
+                    "UPDATE maintenance_config SET value = $1 WHERE key = 'maintenance_interval_seconds'",
+                    float(maintenance_interval),
+                )
+            except Exception:
+                pass
 
             await _set_config(conn, "agent.objectives", objectives)
             await _set_config(
@@ -289,11 +312,19 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
             else:
                 await conn.execute("UPDATE heartbeat_state SET is_paused = TRUE WHERE id = 1")
 
+            try:
+                if enable_maintenance:
+                    await conn.execute("UPDATE maintenance_state SET is_paused = FALSE WHERE id = 1")
+                else:
+                    await conn.execute("UPDATE maintenance_state SET is_paused = TRUE WHERE id = 1")
+            except Exception:
+                pass
+
         print("\nSaved configuration to Postgres `config` table.")
         print("Next steps:")
-        print("- Start services: `docker compose up -d` (or `docker compose --profile active up -d` for the worker)")
-        print("- Run the worker: `docker compose --profile active up -d worker`")
-        print("- Verify: `SELECT is_agent_configured();` and `SELECT should_run_heartbeat();`")
+        print("- Start services: `docker compose up -d`")
+        print("- Start workers: `docker compose --profile active up -d` (or `--profile heartbeat` / `--profile maintenance`)")
+        print("- Verify: `SELECT is_agent_configured();`, `SELECT should_run_heartbeat();`, `SELECT should_run_maintenance();`")
         return 0
     finally:
         await conn.close()
@@ -327,4 +358,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

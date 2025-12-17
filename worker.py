@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-AGI Heartbeat Worker
+AGI Workers
 
-A stateless daemon that:
-1. Polls external_calls table for pending LLM/embedding requests
-2. Sends requests to external APIs (OpenAI, Anthropic, etc.)
-3. Writes results back to the database
-4. Triggers heartbeats on schedule
+This module contains two independent background loops:
 
-The worker has NO agency. All decisions happen in PostgreSQL via the LLM.
-This is just a bridge between the database and external APIs.
+1) Heartbeat worker (conscious trigger):
+   - Polls `external_calls` for pending LLM tasks (think calls)
+   - Triggers scheduled heartbeats via `should_run_heartbeat()` / `start_heartbeat()`
+   - Executes the heartbeat's chosen actions via `execute_heartbeat_action()`
+
+2) Maintenance worker (subconscious substrate upkeep):
+   - Runs `run_subconscious_maintenance()` on its own schedule (`should_run_maintenance()`)
+   - Optionally bridges outbox/inbox to RabbitMQ (integration plumbing)
+
+These are intentionally separate concerns with separate triggers.
 """
 
 import asyncio
@@ -24,6 +28,7 @@ from typing import Any
 import asyncpg
 from dotenv import load_dotenv
 import requests
+import argparse
 
 from prompt_resources import compose_personhood_prompt
 
@@ -66,7 +71,6 @@ DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
 # Worker configuration
 POLL_INTERVAL = float(os.getenv('WORKER_POLL_INTERVAL', 1.0))  # seconds
 MAX_RETRIES = int(os.getenv('WORKER_MAX_RETRIES', 3))
-MAINTENANCE_INTERVAL = float(os.getenv("WORKER_MAINTENANCE_INTERVAL", 60.0))  # seconds
 
 # RabbitMQ (optional outbox/inbox bridge; uses management HTTP API).
 RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
@@ -123,7 +127,7 @@ HEARTBEAT_SYSTEM_PROMPT = (
 class HeartbeatWorker:
     """Stateless worker that bridges the database and external APIs."""
 
-    def __init__(self):
+    def __init__(self, *, init_llm: bool = True):
         self.pool: asyncpg.Pool | None = None
         self.running = False
 
@@ -133,8 +137,9 @@ class HeartbeatWorker:
         self.llm_api_key: str | None = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
 
         self.llm_client = None
-        self._init_llm_client()
-        self._last_rabbit_inbox_poll = 0.0
+        if init_llm:
+            self._init_llm_client()
+        self._last_rabbit_inbox_poll = 0.0  # used only by maintenance mode
 
     def _init_llm_client(self) -> None:
         provider = (self.llm_provider or "").strip().lower()
@@ -184,8 +189,6 @@ class HeartbeatWorker:
         self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=2, max_size=10)
         logger.info(f"Connected to database at {DB_CONFIG['host']}:{DB_CONFIG['port']}")
         await self.refresh_llm_config()
-        if RABBITMQ_ENABLED:
-            await self.ensure_rabbitmq_ready()
 
     async def disconnect(self):
         """Disconnect from the database."""
@@ -469,24 +472,13 @@ class HeartbeatWorker:
                 """, error, call_id)
 
     async def process_embed_call(self, call_input: dict) -> dict:
-        """Process an embedding request."""
-        text = call_input.get('text', '')
+        """
+        Embedding requests are handled inside Postgres via `get_embedding()` (pgsql-http) and the embedding cache.
 
-        if not text:
-            return {'error': 'No text provided'}
-
-        # Use the database's built-in embedding function via HTTP
-        # The get_embedding function in PostgreSQL already handles this
-        # But if we need to do it here for some reason:
-
-        if HAS_OPENAI and self.llm_client:
-            response = self.llm_client.embeddings.create(
-                model="text-embedding-3-small",
-                input=text
-            )
-            return {'embedding': response.data[0].embedding}
-
-        return {'error': 'No embedding provider available'}
+        Keeping a second embedding path in the worker risks model/dimension drift, so `external_calls.call_type='embed'`
+        is treated as unsupported.
+        """
+        raise RuntimeError("external_calls type 'embed' is unsupported; use get_embedding() inside Postgres")
 
     async def process_think_call(self, call_input: dict) -> dict:
         """Process an LLM request stored as an external_calls row with call_type='think'."""
@@ -1090,45 +1082,16 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 logger.info(f"Heartbeat started: {heartbeat_id}")
                 # The think request is now queued; it will be processed in the main loop
 
-    async def run_maintenance(self):
-        """Periodic, non-agentic maintenance tasks."""
-        async with self.pool.acquire() as conn:
-            # Best-effort: each of these may not exist in older schemas.
-            try:
-                recomputed = await conn.fetchval("SELECT batch_recompute_neighborhoods(10)")
-                if recomputed:
-                    logger.info(f"Recomputed neighborhoods: {recomputed}")
-            except Exception as e:
-                logger.debug(f"Neighborhood maintenance skipped: {e}")
-
-            try:
-                deleted = await conn.fetchval("SELECT cleanup_working_memory()")
-                if deleted:
-                    logger.info(f"Cleaned working memory: {deleted}")
-            except Exception as e:
-                logger.debug(f"Working memory cleanup skipped: {e}")
-
-            try:
-                deleted_cache = await conn.fetchval("SELECT cleanup_embedding_cache(INTERVAL '7 days')")
-                if deleted_cache:
-                    logger.info(f"Cleaned embedding cache: {deleted_cache}")
-            except Exception as e:
-                logger.debug(f"Embedding cache cleanup skipped: {e}")
-
     async def run(self):
         """Main worker loop."""
         self.running = True
         logger.info("Heartbeat worker starting...")
 
         await self.connect()
-        last_maintenance = 0.0
 
         try:
             while self.running:
                 try:
-                    if RABBITMQ_ENABLED:
-                        await self.poll_inbox_messages()
-
                     # Process any pending external calls
                     call = await self.claim_pending_call()
 
@@ -1178,14 +1141,6 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     # Check if we should run a heartbeat
                     await self.check_and_run_heartbeat()
 
-                    # Maintenance loop
-                    now = time.time()
-                    if MAINTENANCE_INTERVAL > 0 and now - last_maintenance >= MAINTENANCE_INTERVAL:
-                        last_maintenance = now
-                        await self.run_maintenance()
-                    elif RABBITMQ_ENABLED:
-                        await self.publish_outbox_messages(max_messages=5)
-
                 except Exception as e:
                     logger.error(f"Worker loop error: {e}")
 
@@ -1200,24 +1155,122 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         logger.info("Worker stopping...")
 
 
-async def _amain() -> None:
-    """Async entry point for the worker."""
-    worker = HeartbeatWorker()
+class MaintenanceWorker:
+    """Subconscious maintenance loop: consolidates/prunes substrate on its own trigger."""
+
+    def __init__(self):
+        self.pool: asyncpg.Pool | None = None
+        self.running = False
+        self._last_rabbit_inbox_poll = 0.0
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=1, max_size=5)
+        logger.info(f"Connected to database at {DB_CONFIG['host']}:{DB_CONFIG['port']}")
+        if RABBITMQ_ENABLED:
+            await self.ensure_rabbitmq_ready()
+
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+            logger.info("Disconnected from database")
+
+    async def should_run(self) -> bool:
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval("SELECT should_run_maintenance()"))
+
+    async def run_maintenance_tick(self) -> dict[str, Any]:
+        async with self.pool.acquire() as conn:
+            raw = await conn.fetchval("SELECT run_subconscious_maintenance('{}'::jsonb)")
+            if isinstance(raw, str):
+                return json.loads(raw)
+            return dict(raw) if isinstance(raw, dict) else {"result": raw}
+
+    async def run_if_due(self) -> None:
+        if await self.should_run():
+            stats = await self.run_maintenance_tick()
+            logger.info(f"Subconscious maintenance: {stats}")
+
+    # RabbitMQ (optional outbox/inbox bridge; uses management HTTP API).
+    async def ensure_rabbitmq_ready(self) -> None:
+        # Reuse the existing implementation on HeartbeatWorker for now.
+        hw = HeartbeatWorker(init_llm=False)
+        hw.pool = self.pool
+        await hw.ensure_rabbitmq_ready()
+
+    async def publish_outbox_messages(self, max_messages: int = 20) -> int:
+        hw = HeartbeatWorker(init_llm=False)
+        hw.pool = self.pool
+        return await hw.publish_outbox_messages(max_messages=max_messages)
+
+    async def poll_inbox_messages(self, max_messages: int = 10) -> int:
+        hw = HeartbeatWorker(init_llm=False)
+        hw.pool = self.pool
+        # Prevent inbox polling from running too often.
+        hw._last_rabbit_inbox_poll = self._last_rabbit_inbox_poll
+        n = await hw.poll_inbox_messages(max_messages=max_messages)
+        self._last_rabbit_inbox_poll = hw._last_rabbit_inbox_poll
+        return n
+
+    async def run(self):
+        self.running = True
+        logger.info("Maintenance worker starting...")
+        await self.connect()
+        try:
+            while self.running:
+                try:
+                    if RABBITMQ_ENABLED:
+                        await self.poll_inbox_messages()
+                        await self.publish_outbox_messages(max_messages=10)
+                    await self.run_if_due()
+                except Exception as e:
+                    logger.error(f"Maintenance loop error: {e}")
+                await asyncio.sleep(POLL_INTERVAL)
+        finally:
+            await self.disconnect()
+
+    def stop(self):
+        self.running = False
+        logger.info("Maintenance worker stopping...")
+
+
+async def _amain(mode: str) -> None:
+    """Async entry point for workers."""
+    hb_worker = HeartbeatWorker()
+    maint_worker = MaintenanceWorker()
 
     import signal
 
     def shutdown(signum, frame):
-        worker.stop()
+        hb_worker.stop()
+        maint_worker.stop()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    await worker.run()
+    mode = (mode or "both").strip().lower()
+    if mode == "heartbeat":
+        await hb_worker.run()
+        return
+    if mode == "maintenance":
+        await maint_worker.run()
+        return
+    if mode == "both":
+        await asyncio.gather(hb_worker.run(), maint_worker.run())
+        return
+    raise ValueError("mode must be one of: heartbeat, maintenance, both")
 
 
 def main() -> int:
     """Console-script entry point."""
-    asyncio.run(_amain())
+    p = argparse.ArgumentParser(prog="agi-worker", description="Run AGI background workers.")
+    p.add_argument(
+        "--mode",
+        choices=["heartbeat", "maintenance", "both"],
+        default=os.getenv("AGI_WORKER_MODE", "both"),
+        help="Which worker to run.",
+    )
+    args = p.parse_args()
+    asyncio.run(_amain(args.mode))
     return 0
 
 

@@ -1,6 +1,6 @@
 # AGI Memory System
 
-Postgres-first “agent brain”: memories, goals, a scheduled heartbeat, and a stateless worker that bridges the DB to LLM/embedding services.
+Postgres-first “agent brain”: memories, goals, a scheduled heartbeat, and stateless background workers (heartbeat + maintenance) that bridge the DB to LLM/embedding services.
 
 ## Overview
 
@@ -37,7 +37,7 @@ Autonomous heartbeats are **gated** until setup is complete:
 ./agi init  # or `agi init` if you've installed the package
 
 # If you want autonomy:
-docker compose --profile active up -d worker
+docker compose --profile active up -d
 ```
 
 Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
@@ -107,22 +107,23 @@ Conceptual flow:
 - LLM calls `remember_batch` after a conversation
 - LLM calls `hydrate` before answering a user
 
-### 4) Worker + Heartbeat (Autonomous State Management)
+### 4) Workers + Heartbeat (Autonomous State Management)
 
-Turn on the worker so the database can schedule heartbeats and process `external_calls`.
+Turn on the workers so the database can schedule heartbeats, process `external_calls`, and keep the memory substrate healthy.
 
 ```bash
-docker compose --profile active up -d worker
+docker compose --profile active up -d
 ```
 
 Conceptual flow:
 - DB decides when a heartbeat is due (`should_run_heartbeat()`)
-- Worker queues/fulfills LLM calls (`external_calls`)
+- Heartbeat worker queues/fulfills LLM calls (`external_calls`)
+- Maintenance worker runs consolidation/pruning ticks (`should_run_maintenance()` / `run_subconscious_maintenance()`)
 - DB records outcomes (`heartbeat_log`, new memories, goals, etc.)
 
 ### 5) Headless “Agent Brain” Backend (Shared Service)
 
-Run db+embeddings(+worker) as a standalone backend; multiple apps connect over Postgres.
+Run db+embeddings(+workers) as a standalone backend; multiple apps connect over Postgres.
 
 ```text
 webapp  ─┐
@@ -324,7 +325,10 @@ agi config validate
 agi demo
 agi chat --endpoint http://localhost:11434/v1 --model llama3.2
 agi ingest --input ./documents
-agi worker
+agi start   # docker compose --profile active up -d (runs both workers)
+agi stop
+agi worker -- --mode heartbeat      # run heartbeat worker locally
+agi worker -- --mode maintenance    # run maintenance worker locally
 agi mcp
 ```
 
@@ -341,19 +345,24 @@ agi mcp
 
 The server supports batch-style tools like `remember_batch`, `connect_batch`, `hydrate_batch`, and a generic `batch` tool for sequential tool calls.
 
-## Heartbeat Worker
+## Heartbeat + Maintenance Workers
 
-The autonomous heartbeat runs via a stateless background worker that:
+The system has two independent background workers with separate triggers:
+
+- **Heartbeat worker** (conscious): polls `external_calls` and triggers scheduled heartbeats (`should_run_heartbeat()` → `start_heartbeat()`).
+- **Maintenance worker** (subconscious): runs substrate upkeep on its own schedule (`should_run_maintenance()` → `run_subconscious_maintenance()`), and can optionally bridge outbox/inbox to RabbitMQ.
+
+The heartbeat worker:
 - polls `external_calls` for pending LLM work
 - triggers scheduled heartbeats (`start_heartbeat()`)
 - executes heartbeat actions and records the result
 
-### Turning The Worker On/Off
+### Turning Workers On/Off
 
 You generally want **two modes**:
 
-- **Passive / RAG-only**: use `hydrate()/recall()/remember()` without autonomous execution → run **no worker**
-- **Active / autonomous**: process `external_calls`, run scheduled heartbeats, and do maintenance → run **the worker**
+- **Passive / RAG-only**: use `hydrate()/recall()/remember()` without autonomous execution → run **no workers**
+- **Active / autonomous**: process `external_calls`, run scheduled heartbeats, and do maintenance → run **both workers**
 
 With Docker Compose:
 
@@ -361,31 +370,60 @@ With Docker Compose:
 # Default (passive mode): start db + embeddings only
 docker compose up -d
 
-# Active mode: start db + embeddings + worker
+# Active mode: start db + embeddings + both workers
 docker compose --profile active up -d
 
-# Start only the worker (and its dependencies)
-docker compose --profile active up -d worker
+# Start only the heartbeat worker
+docker compose --profile heartbeat up -d
 
-# Stop the worker (container stays)
-docker compose stop worker
+# Start only the maintenance worker
+docker compose --profile maintenance up -d
 
-# Stop + remove the worker container
-docker compose rm -f worker
+# Stop the workers (containers stay)
+docker compose stop heartbeat_worker maintenance_worker
 
-# Restart the worker
-docker compose restart worker
+# Stop + remove the worker containers
+docker compose rm -f heartbeat_worker maintenance_worker
 
-# Passive mode: run DB + embeddings only (no worker)
+# Restart the workers
+docker compose restart heartbeat_worker maintenance_worker
+
+# Passive mode: run DB + embeddings only (no workers)
 docker compose up -d db embeddings
 ```
 
+### Pausing From The DB (Without Stopping Containers)
+
+If you want the containers running but **no autonomous activity**, pause either loop in Postgres:
+
+```sql
+-- Pause conscious decision-making (heartbeats)
+UPDATE heartbeat_state SET is_paused = TRUE WHERE id = 1;
+
+-- Pause subconscious upkeep (maintenance ticks)
+UPDATE maintenance_state SET is_paused = TRUE WHERE id = 1;
+
+-- Resume
+UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1;
+UPDATE maintenance_state SET is_paused = FALSE WHERE id = 1;
+```
+
+Note: heartbeats are also gated by `agent.is_configured` (set by `agi init`).
+
 ### Running Locally (Optional)
 
-You can also run the worker on your host machine (it will connect to Postgres over TCP):
+You can also run the workers on your host machine (they will connect to Postgres over TCP):
 
 ```bash
-agi worker
+agi-worker --mode heartbeat
+agi-worker --mode maintenance
+```
+
+Or via the CLI wrapper:
+
+```bash
+agi worker -- --mode heartbeat
+agi worker -- --mode maintenance
 ```
 
 If you already have an existing DB volume, the schema init scripts won’t re-run automatically. The simplest upgrade path is to reset the DB volume:
@@ -409,7 +447,7 @@ The Docker stack includes RabbitMQ (management UI + AMQP) as a default “inbox/
 - AMQP: `amqp://localhost:5672`
 - Default credentials: `agi` / `agi_password` (override via `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`)
 
-When the worker is running with `RABBITMQ_ENABLED=1`, it will:
+When the maintenance worker is running with `RABBITMQ_ENABLED=1`, it will:
 - publish pending DB `outbox_messages` to the RabbitMQ queue `agi.outbox`
 - poll `agi.inbox` and insert messages into DB working memory (so the agent can “hear” them)
 
@@ -448,33 +486,15 @@ If you change `EMBEDDING_DIMENSION` on an existing database volume, reset the DB
 
 ## System Maintenance
 
-The memory system requires three key maintenance processes to function effectively:
+By default, substrate upkeep is handled by the **maintenance worker**, which runs `run_subconscious_maintenance()` whenever `should_run_maintenance()` is true.
 
-### 1. Memory Consolidation
-Short-term memories need to be consolidated into long-term storage. This process should:
-- Move frequently accessed items from working memory to permanent storage
-- Run periodically (recommended every 4-6 hours)
-- Consider memory importance and access patterns
+That maintenance tick currently:
 
-### 2. Memory Pruning
-The system needs regular cleanup to prevent overwhelming storage:
-- Archive or remove low-relevance memories
-- Decay importance scores of unused memories
-- Run daily or weekly, depending on system usage
+- Promotes/deletes working memory (`cleanup_working_memory_with_stats`)
+- Recomputes stale neighborhoods (`batch_recompute_neighborhoods`)
+- Prunes embedding cache (`cleanup_embedding_cache`)
 
-### 3. Database Optimization
-Regular database maintenance ensures optimal performance:
-- Reindex tables for efficient vector searches
-- Update statistics for query optimization
-- Run during off-peak hours
-
-### Implementation Note
-These maintenance tasks can be implemented using:
-- Database scheduling tools
-- External task schedulers
-- System-level scheduling (cron, systemd, etc.)
-
-Choose the scheduling method that best fits your infrastructure and monitoring capabilities. Ensure proper logging and error handling for all maintenance operations.
+If you don’t want to run the maintenance worker, you can schedule `SELECT run_subconscious_maintenance();` via cron/systemd/etc. The function uses an advisory lock so multiple schedulers won’t double-run a tick.
 
 ## Troubleshooting
 
@@ -483,6 +503,7 @@ Choose the scheduling method that best fits your infrastructure and monitoring c
 **Database Connection Errors:**
 - Ensure PostgreSQL is running: `docker compose ps`
 - Check logs: `docker compose logs db`
+- Worker logs (if running): `docker compose logs heartbeat_worker` / `docker compose logs maintenance_worker`
 - Verify extensions: Run test suite with `pytest test.py -v`
 
 **Memory Search Performance:**

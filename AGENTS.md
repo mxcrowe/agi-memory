@@ -3,8 +3,8 @@
 ## Project Structure & Module Organization
 
 - `schema.sql`: single source of truth for the database schema (extensions, tables, functions, triggers, views). Schema is applied on fresh DB init.
-- `docker-compose.yml`, `Dockerfile`, `Dockerfile.worker`: local stack (Postgres + embeddings + optional worker).
-- `worker.py`: stateless daemon that processes `external_calls` and schedules heartbeats.
+- `docker-compose.yml`, `Dockerfile`, `Dockerfile.worker`: local stack (Postgres + embeddings + optional workers).
+- `worker.py`: stateless workers: heartbeat (conscious) + maintenance (subconscious).
 - `cognitive_memory_api.py`: thin Python client for the “DB is the brain” API surface.
 - `agi_cli.py`: CLI entrypoint (`agi …`) for local workflows; `agi_init.py` bootstraps DB config; `agi_mcp_server.py` exposes MCP tools.
 - `test.py`: integration test suite (pytest + asyncpg) covering schema + worker + Python API.
@@ -13,7 +13,7 @@
 ## Build, Test, and Development Commands
 
 - Start services (passive): `docker compose up -d` (db + embeddings).
-- Start services (active): `docker compose --profile active up -d` (adds `worker`).
+- Start services (active): `docker compose --profile active up -d` (adds `heartbeat_worker` + `maintenance_worker`).
 - Reset DB volume (schema changes): `docker compose down -v && docker compose up -d`.
 - Configure agent (gates heartbeats): `./agi init` (or `agi init` if installed).
 - Run tests: `pytest test.py -q` (expects Docker services up).

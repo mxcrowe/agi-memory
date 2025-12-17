@@ -78,12 +78,33 @@ services:
       - private
       - public  # Needed for initial model download from HuggingFace
 
-  worker:
-    profiles: ["active"]
+  heartbeat_worker:
+    profiles: ["active", "heartbeat"]
     build:
       context: .
       dockerfile: Dockerfile.worker
-    container_name: agi_worker
+    container_name: agi_heartbeat_worker
+    command: ["agi-worker", "--mode", "heartbeat"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      RABBITMQ_ENABLED: "0"
+    networks:
+      - private
+      - public
+
+  maintenance_worker:
+    profiles: ["active", "maintenance"]
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: agi_maintenance_worker
+    command: ["agi-worker", "--mode", "maintenance"]
     depends_on:
       db:
         condition: service_healthy
