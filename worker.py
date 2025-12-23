@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -1004,21 +1005,49 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     )
                     break
 
-            # Apply goal changes
+            # Apply goal changes (accept UUIDs or goal titles safely)
+            import uuid
+
             for change in goal_changes:
-                goal_id = change.get("goal_id")
+                raw_goal_id = change.get("goal_id")
                 change_type = change.get("change")
                 reason = change.get("reason", "")
 
-                if goal_id and change_type:
-                    await conn.execute(
+                if not raw_goal_id or not change_type:
+                    continue
+                goal_uuid = None
+                # 1) If it's already a UUID string, use it
+                try:
+                    goal_uuid = str(uuid.UUID(str(raw_goal_id)))
+                except Exception:
+                    goal_uuid = None
+
+                # 2) Otherwise treat it as a goal title and resolve to an id
+                if goal_uuid is None:
+                    goal_uuid = await conn.fetchval(
                         """
-                        SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)
-                    """,
-                        goal_id,
-                        change_type,
-                        reason,
+                        SELECT id
+                        FROM goals
+                        WHERE title = $1
+                        ORDER BY last_touched DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        str(raw_goal_id),
                     )
+
+                if goal_uuid is None:
+                    logger.warning(
+                        f"Skipping goal_change: could not resolve goal_id/title '{raw_goal_id}'"
+                    )
+                    continue
+                await conn.execute(
+                    """
+                    SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)
+                    """,
+                    goal_uuid,
+                    change_type,
+                    reason,
+                )
 
             # Complete the heartbeat
             memory_id = await conn.fetchval(
