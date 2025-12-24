@@ -33,6 +33,10 @@ from dotenv import load_dotenv
 
 from prompt_resources import compose_personhood_prompt
 
+logging.getLogger(__name__).warning(
+    "🚨 HEARTBEAT WORKER STARTUP MARKER v2025-12-23T18:45Z 🚨"
+)
+
 # Optional: Import LLM clients
 try:
     import openai
@@ -1003,10 +1007,10 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     logger.info(
                         f"Action {action} failed: {result_dict.get('error', 'unknown')}"
                     )
-                    break
-
-            # Apply goal changes (accept UUIDs or goal titles safely)
-            import uuid
+                    break  # Apply goal changes
+            # NOTE: The model may emit semantic identifiers (titles/keys) instead of UUIDs.
+            # We resolve goal_id to a UUID when possible and only send UUIDs to the DB.
+            sanitized_goal_changes = []
 
             for change in goal_changes:
                 raw_goal_id = change.get("goal_id")
@@ -1015,7 +1019,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
 
                 if not raw_goal_id or not change_type:
                     continue
+
                 goal_uuid = None
+
                 # 1) If it's already a UUID string, use it
                 try:
                     goal_uuid = str(uuid.UUID(str(raw_goal_id)))
@@ -1040,6 +1046,7 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                         f"Skipping goal_change: could not resolve goal_id/title '{raw_goal_id}'"
                     )
                     continue
+
                 await conn.execute(
                     """
                     SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)
@@ -1047,6 +1054,10 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     goal_uuid,
                     change_type,
                     reason,
+                )
+
+                sanitized_goal_changes.append(
+                    {"goal_id": goal_uuid, "change": change_type, "reason": reason}
                 )
 
             # Complete the heartbeat
@@ -1057,7 +1068,7 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 heartbeat_id,
                 reasoning,
                 json.dumps(actions_taken),
-                json.dumps(goal_changes),
+                json.dumps(sanitized_goal_changes),
                 json.dumps(decision.get("emotional_assessment"))
                 if isinstance(decision.get("emotional_assessment"), dict)
                 else None,
@@ -1311,7 +1322,18 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                             await self.complete_call(call_id, result)
 
                         except Exception as e:
-                            logger.error(f"Error processing call {call_id}: {e}")
+                            logger.exception(f"Error processing call {call_id}: {e}")
+
+                            # Extra diagnostics for Postgres errors (shows CONTEXT / DETAIL / HINT)
+                            if isinstance(e, asyncpg.PostgresError):
+                                logger.error(f"PG DETAIL: {getattr(e, 'detail', None)}")
+                                logger.error(
+                                    f"PG CONTEXT: {getattr(e, 'context', None)}"
+                                )
+                                logger.error(f"PG HINT: {getattr(e, 'hint', None)}")
+
+                            raise
+
                             await self.fail_call(call_id, str(e))
 
                     # Check if we should run a heartbeat

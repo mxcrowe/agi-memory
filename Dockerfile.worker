@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 COPY pyproject.toml README.md /app/
-COPY agi_cli.py agi_init.py agi_mcp_server.py conversation.py ingest.py memory_tools.py worker.py cognitive_memory_api.py /app/
+COPY agi_cli.py agi_init.py agi_mcp_server.py conversation.py ingest.py memory_tools.py worker.py cognitive_memory_api.py prompt_resources.py /app/
+COPY prompts/ /app/prompts/
 
 RUN pip install --no-cache-dir .
 

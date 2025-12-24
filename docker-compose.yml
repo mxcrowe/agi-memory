@@ -1,18 +1,22 @@
 services:
   db:
-    build: .  # Points to the Dockerfile above
+    build: . # Points to the Dockerfile above
     container_name: agi_brain
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-agi_memory}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       # Important for AGE extension
-      POSTGRES_HOST_AUTH_METHOD: trust 
+      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # schema.sql is baked into the image (see Dockerfile) to avoid bind-mount issues on macOS external drives.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agi_memory}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agi_memory}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -55,7 +59,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     container_name: agi_embeddings
     platform: linux/amd64
-    command: 
+    command:
       - --model-id
       - ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       - --dtype
@@ -65,7 +69,7 @@ services:
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
     expose:
-      - "80"  # internal-only; reachable from Postgres as http://embeddings:80
+      - "80" # internal-only; reachable from Postgres as http://embeddings:80
     volumes:
       - embeddings_cache:/data
     healthcheck:
@@ -76,7 +80,7 @@ services:
       start_period: 60s
     networks:
       - private
-      - public  # Needed for initial model download from HuggingFace
+      - public # Needed for initial model download from HuggingFace
 
   heartbeat_worker:
     profiles: ["active", "heartbeat"]
@@ -91,6 +95,10 @@ services:
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-agi_memory}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       RABBITMQ_ENABLED: "0"

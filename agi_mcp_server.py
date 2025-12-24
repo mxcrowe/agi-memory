@@ -80,7 +80,9 @@ def _require(args: dict[str, Any], key: str, tool: str) -> Any:
     return args[key]
 
 
-async def _dispatch_tool(client: CognitiveMemory, name: str, args: dict[str, Any]) -> Any:
+async def _dispatch_tool(
+    client: CognitiveMemory, name: str, args: dict[str, Any]
+) -> Any:
     if name == "hydrate":
         query = _require(args, "query", name)
         return await client.hydrate(
@@ -242,7 +244,9 @@ async def _dispatch_tool(client: CognitiveMemory, name: str, args: dict[str, Any
 
     if name == "hold":
         content = _require(args, "content", name)
-        return await client.hold(content, ttl_seconds=int(args.get("ttl_seconds", 3600)))
+        return await client.hold(
+            content, ttl_seconds=int(args.get("ttl_seconds", 3600))
+        )
 
     if name == "search_working":
         query = _require(args, "query", name)
@@ -295,7 +299,12 @@ def _tools() -> list[Any]:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "memory_limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "memory_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                    },
                     "include_partial": {"type": "boolean", "default": True},
                     "include_identity": {"type": "boolean", "default": True},
                     "include_worldview": {"type": "boolean", "default": True},
@@ -313,8 +322,17 @@ def _tools() -> list[Any]:
             {
                 "type": "object",
                 "properties": {
-                    "queries": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    "memory_limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                    "memory_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                    },
                     "include_partial": {"type": "boolean", "default": True},
                     "include_identity": {"type": "boolean", "default": True},
                     "include_worldview": {"type": "boolean", "default": True},
@@ -333,12 +351,25 @@ def _tools() -> list[Any]:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                    },
                     "memory_types": {
                         "type": ["array", "null"],
-                        "items": {"type": "string", "enum": [t.value for t in MemoryType]},
+                        "items": {
+                            "type": "string",
+                            "enum": [t.value for t in MemoryType],
+                        },
                     },
-                    "min_importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
+                    "min_importance": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.0,
+                    },
                     "include_partial": {"type": "boolean", "default": True},
                 },
                 "required": ["query"],
@@ -361,8 +392,16 @@ def _tools() -> list[Any]:
             {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 10},
-                    "memory_type": {"type": ["string", "null"], "enum": [t.value for t in MemoryType] + [None]},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 10,
+                    },
+                    "memory_type": {
+                        "type": ["string", "null"],
+                        "enum": [t.value for t in MemoryType] + [None],
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -374,11 +413,28 @@ def _tools() -> list[Any]:
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
-                    "type": {"type": "string", "enum": [t.value for t in MemoryType], "default": MemoryType.EPISODIC.value},
-                    "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5},
-                    "emotional_valence": {"type": "number", "minimum": -1.0, "maximum": 1.0, "default": 0.0},
+                    "type": {
+                        "type": "string",
+                        "enum": [t.value for t in MemoryType],
+                        "default": MemoryType.EPISODIC.value,
+                    },
+                    "importance": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.5,
+                    },
+                    "emotional_valence": {
+                        "type": "number",
+                        "minimum": -1.0,
+                        "maximum": 1.0,
+                        "default": 0.0,
+                    },
                     "context": {"type": ["object", "null"]},
-                    "concepts": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "concepts": {
+                        "type": ["array", "null"],
+                        "items": {"type": "string"},
+                    },
                 },
                 "required": ["content"],
                 "additionalProperties": False,
@@ -397,11 +453,28 @@ def _tools() -> list[Any]:
                             "type": "object",
                             "properties": {
                                 "content": {"type": "string"},
-                                "type": {"type": "string", "enum": [t.value for t in MemoryType], "default": MemoryType.EPISODIC.value},
-                                "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5},
-                                "emotional_valence": {"type": "number", "minimum": -1.0, "maximum": 1.0, "default": 0.0},
+                                "type": {
+                                    "type": "string",
+                                    "enum": [t.value for t in MemoryType],
+                                    "default": MemoryType.EPISODIC.value,
+                                },
+                                "importance": {
+                                    "type": "number",
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "default": 0.5,
+                                },
+                                "emotional_valence": {
+                                    "type": "number",
+                                    "minimum": -1.0,
+                                    "maximum": 1.0,
+                                    "default": 0.0,
+                                },
                                 "context": {"type": ["object", "null"]},
-                                "concepts": {"type": ["array", "null"], "items": {"type": "string"}},
+                                "concepts": {
+                                    "type": ["array", "null"],
+                                    "items": {"type": "string"},
+                                },
                             },
                             "required": ["content"],
                             "additionalProperties": False,
@@ -418,10 +491,26 @@ def _tools() -> list[Any]:
             {
                 "type": "object",
                 "properties": {
-                    "contents": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    "embeddings": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
-                    "type": {"type": "string", "enum": [t.value for t in MemoryType], "default": MemoryType.EPISODIC.value},
-                    "importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5},
+                    "contents": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                    "embeddings": {
+                        "type": "array",
+                        "items": {"type": "array", "items": {"type": "number"}},
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": [t.value for t in MemoryType],
+                        "default": MemoryType.EPISODIC.value,
+                    },
+                    "importance": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.5,
+                    },
                 },
                 "required": ["contents", "embeddings"],
                 "additionalProperties": False,
@@ -435,8 +524,16 @@ def _tools() -> list[Any]:
                 "properties": {
                     "from_id": {"type": "string"},
                     "to_id": {"type": "string"},
-                    "relationship": {"type": "string", "enum": [t.value for t in RelationshipType]},
-                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.8},
+                    "relationship": {
+                        "type": "string",
+                        "enum": [t.value for t in RelationshipType],
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.8,
+                    },
                     "context": {"type": ["string", "null"]},
                 },
                 "required": ["from_id", "to_id", "relationship"],
@@ -457,8 +554,16 @@ def _tools() -> list[Any]:
                             "properties": {
                                 "from_id": {"type": "string"},
                                 "to_id": {"type": "string"},
-                                "relationship_type": {"type": "string", "enum": [t.value for t in RelationshipType]},
-                                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.8},
+                                "relationship_type": {
+                                    "type": "string",
+                                    "enum": [t.value for t in RelationshipType],
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "minimum": 0.0,
+                                    "maximum": 1.0,
+                                    "default": 0.8,
+                                },
                                 "context": {"type": ["string", "null"]},
                             },
                             "required": ["from_id", "to_id", "relationship_type"],
@@ -477,7 +582,12 @@ def _tools() -> list[Any]:
                 "type": "object",
                 "properties": {
                     "memory_id": {"type": "string"},
-                    "depth": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 3,
+                    },
                 },
                 "required": ["memory_id"],
                 "additionalProperties": False,
@@ -510,7 +620,12 @@ def _tools() -> list[Any]:
                 "properties": {
                     "memory_id": {"type": "string"},
                     "concept": {"type": "string"},
-                    "strength": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0},
+                    "strength": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 1.0,
+                    },
                 },
                 "required": ["memory_id", "concept"],
                 "additionalProperties": False,
@@ -521,7 +636,15 @@ def _tools() -> list[Any]:
             "Retrieve memories linked to a concept.",
             {
                 "type": "object",
-                "properties": {"concept": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 10}},
+                "properties": {
+                    "concept": {"type": "string"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 10,
+                    },
+                },
                 "required": ["concept"],
                 "additionalProperties": False,
             },
@@ -533,7 +656,12 @@ def _tools() -> list[Any]:
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
-                    "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600},
+                    "ttl_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 604800,
+                        "default": 3600,
+                    },
                 },
                 "required": ["content"],
                 "additionalProperties": False,
@@ -546,22 +674,48 @@ def _tools() -> list[Any]:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 5,
+                    },
                 },
                 "required": ["query"],
                 "additionalProperties": False,
             },
         ),
-        _tool("get_health", "Get cognitive health metrics.", {"type": "object", "properties": {}, "additionalProperties": False}),
-        _tool("get_drives", "Get current drive levels.", {"type": "object", "properties": {}, "additionalProperties": False}),
-        _tool("get_identity", "Get identity aspects.", {"type": "object", "properties": {}, "additionalProperties": False}),
-        _tool("get_worldview", "Get worldview primitives.", {"type": "object", "properties": {}, "additionalProperties": False}),
+        _tool(
+            "get_health",
+            "Get cognitive health metrics.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        _tool(
+            "get_drives",
+            "Get current drive levels.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        _tool(
+            "get_identity",
+            "Get identity aspects.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        ),
+        _tool(
+            "get_worldview",
+            "Get worldview primitives.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        ),
         _tool(
             "get_goals",
             "Get goals (optionally filtered by priority).",
             {
                 "type": "object",
-                "properties": {"priority": {"type": ["string", "null"], "enum": [g.value for g in GoalPriority] + [None]}},
+                "properties": {
+                    "priority": {
+                        "type": ["string", "null"],
+                        "enum": [g.value for g in GoalPriority] + [None],
+                    }
+                },
                 "additionalProperties": False,
             },
         ),
@@ -606,42 +760,49 @@ async def _run_server(dsn: str) -> None:
 
     server = Server("agi-memory-mcp")
 
-    client = await CognitiveMemory.connect(dsn)
+    async with CognitiveMemory.connect(dsn) as client:
 
-    @server.list_tools()
-    async def list_tools():
-        return _tools()
+        @server.list_tools()
+        async def list_tools():
+            return _tools()
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]):
+        @server.call_tool()
+        async def call_tool(name: str, arguments: dict[str, Any]):
+            try:
+                result = await _dispatch_tool(client, name, arguments or {})
+                text = json.dumps(_jsonable(result), indent=2, sort_keys=True)
+            except Exception as exc:
+                text = f"Error: {exc}"
+            return [TextContent(type="text", text=text)]
+
         try:
-            result = await _dispatch_tool(client, name, arguments or {})
-            text = json.dumps(_jsonable(result), indent=2, sort_keys=True)
-        except Exception as exc:
-            text = f"Error: {exc}"
-        return [TextContent(type="text", text=text)]
+            try:
+                server_version = version("agi-memory")
+            except PackageNotFoundError:  # local dev
+                server_version = "dev"
 
-    try:
-        try:
-            server_version = version("agi-memory")
-        except PackageNotFoundError:  # local dev
-            server_version = "dev"
+            init_opts = InitializationOptions(
+                server_name="agi-memory-mcp",
+                server_version=server_version,
+                capabilities=ServerCapabilities(tools=ToolsCapability()),
+            )
 
-        init_opts = InitializationOptions(
-            server_name="agi-memory-mcp",
-            server_version=server_version,
-            capabilities=ServerCapabilities(tools=ToolsCapability()),
-        )
-
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream, init_opts)
-    finally:
-        await client.close()
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(read_stream, write_stream, init_opts)
+        finally:
+            pass  # Cleanup handled by async context managers
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="agi-mcp", description="MCP server exposing CognitiveMemory tools over stdio.")
-    p.add_argument("--dsn", default=os.getenv("AGI_DB_DSN") or None, help="Postgres DSN; defaults to POSTGRES_* env vars")
+    p = argparse.ArgumentParser(
+        prog="agi-mcp",
+        description="MCP server exposing CognitiveMemory tools over stdio.",
+    )
+    p.add_argument(
+        "--dsn",
+        default=os.getenv("AGI_DB_DSN") or None,
+        help="Postgres DSN; defaults to POSTGRES_* env vars",
+    )
     return p
 
 
