@@ -12,7 +12,7 @@ EXCEPTION
   WHEN OTHERS THEN
     RETURN NULL;
 END;
-$function$;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.create_semantic_memory(p_content text, p_confidence double precision, p_category text[] DEFAULT NULL::text[], p_related_concepts text[] DEFAULT NULL::text[], p_source_references jsonb DEFAULT NULL::jsonb, p_importance double precision DEFAULT 0.5, p_source_attribution jsonb DEFAULT NULL::jsonb, p_trust_level double precision DEFAULT NULL::double precision)
@@ -58,7 +58,7 @@ BEGIN
 
     RETURN new_memory_id;
 END;
-$function$;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.process_reflection_result(p_heartbeat_id uuid, p_result jsonb)
@@ -232,5 +232,5 @@ BEGIN
         END LOOP;
     END IF;
 END;
-$function$;
+$function$
 
