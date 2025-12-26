@@ -20,6 +20,7 @@ CREATE EXTENSION IF NOT EXISTS http;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 LOAD 'age';
+SET search_path = ag_catalog, "$user", public;
 
 -- ============================================================================
 -- GRAPH INITIALIZATION
@@ -1856,46 +1857,153 @@ $$ LANGUAGE plpgsql;
 -- Create graph relationship between memories
 
 
--- Link memory to concept (fixed 122525)
-CREATE OR REPLACE FUNCTION public.link_memory_to_concept(p_memory_id uuid, p_concept_name text, p_strength double precision DEFAULT 1.0)
- RETURNS uuid
- LANGUAGE plpgsql
-AS $function$
+-- Link memory to concept
+CREATE OR REPLACE FUNCTION link_memory_to_concept(
+    p_memory_id UUID,
+    p_concept_name TEXT,
+    p_strength FLOAT DEFAULT 1.0
+) RETURNS UUID AS $$
 DECLARE
-    v_concept_id UUID;
-    v_concept_cypher TEXT;
+    concept_id UUID;
 BEGIN
-    -- Relational upsert (safe)
+    -- Get or create concept
     INSERT INTO concepts (name)
     VALUES (p_concept_name)
     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-    RETURNING id INTO v_concept_id;
-
+    RETURNING id INTO concept_id;
+    
+    -- Create relational link
     INSERT INTO memory_concepts (memory_id, concept_id, strength)
-    VALUES (p_memory_id, v_concept_id, p_strength)
-    ON CONFLICT (memory_id, concept_id)
-    DO UPDATE SET strength = EXCLUDED.strength;
-
-    -- Cypher needs backslash escaping for apostrophes inside single-quoted literals
-    -- An'nuk  ->  An\'nuk
-    v_concept_cypher := replace(p_concept_name, '''', E'\\\'');
-
+    VALUES (p_memory_id, concept_id, p_strength)
+    ON CONFLICT DO NOTHING;
+    
+    -- Create graph edge
     EXECUTE format(
         'SELECT * FROM cypher(''memory_graph'', $q$
-            MATCH (m:MemoryNode {memory_id: ''%s''})
-            MERGE (c:ConceptNode {name: ''%s''})
-            MERGE (m)-[r:INSTANCE_OF]->(c)
-            SET r.strength = %s
+            MATCH (m:MemoryNode {memory_id: %L})
+            MERGE (c:ConceptNode {name: %L})
+            CREATE (m)-[:INSTANCE_OF {strength: %s}]->(c)
             RETURN c
         $q$) as (result agtype)',
-        p_memory_id::text,
-        v_concept_cypher,
-        COALESCE(p_strength, 1.0)
+        p_memory_id,
+        p_concept_name,
+        p_strength
+    );
+    
+    RETURN concept_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Touch working memory rows (access tracking for consolidation heuristics)
+CREATE OR REPLACE FUNCTION touch_working_memory(p_ids UUID[])
+RETURNS VOID AS $$
+BEGIN
+    IF p_ids IS NULL OR array_length(p_ids, 1) IS NULL THEN
+        RETURN;
+    END IF;
+
+    UPDATE working_memory
+    SET access_count = access_count + 1,
+        last_accessed = CURRENT_TIMESTAMP
+    WHERE id = ANY(p_ids);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Promote a working-memory item into long-term episodic memory (preserving the existing embedding).
+CREATE OR REPLACE FUNCTION promote_working_memory_to_episodic(
+    p_working_memory_id UUID,
+    p_importance FLOAT DEFAULT NULL
+)
+RETURNS UUID AS $$
+DECLARE
+    wm RECORD;
+    new_id UUID;
+    affect JSONB;
+    v_valence FLOAT;
+BEGIN
+    SELECT * INTO wm FROM working_memory WHERE id = p_working_memory_id;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+
+    affect := get_current_affective_state();
+    BEGIN
+        v_valence := NULLIF(affect->>'valence', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            v_valence := 0.0;
+    END;
+    v_valence := LEAST(1.0, GREATEST(-1.0, COALESCE(v_valence, 0.0)));
+
+    new_id := create_memory_with_embedding(
+        'episodic'::memory_type,
+        wm.content,
+        wm.embedding,
+        COALESCE(p_importance, wm.importance, 0.4),
+        wm.source_attribution,
+        wm.trust_level
     );
 
-    RETURN v_concept_id;
+    INSERT INTO episodic_memories (memory_id, action_taken, context, result, emotional_valence, verification_status, event_time)
+    VALUES (
+        new_id,
+        NULL,
+        jsonb_build_object(
+            'from_working_memory_id', wm.id,
+            'promoted_at', CURRENT_TIMESTAMP,
+            'working_memory_created_at', wm.created_at,
+            'working_memory_expiry', wm.expiry,
+            'source_attribution', wm.source_attribution
+        ),
+        NULL,
+        v_valence,
+        NULL,
+        wm.created_at
+    )
+    ON CONFLICT (memory_id) DO NOTHING;
+
+    RETURN new_id;
 END;
-$function$;
+$$ LANGUAGE plpgsql;
+
+-- Clean expired working memory (with optional consolidation before delete).
+CREATE OR REPLACE FUNCTION cleanup_working_memory_with_stats(
+    p_min_importance_to_promote FLOAT DEFAULT 0.75,
+    p_min_accesses_to_promote INT DEFAULT 3
+)
+RETURNS JSONB AS $$
+DECLARE
+    promoted UUID[] := ARRAY[]::uuid[];
+    rec RECORD;
+    deleted_count INT := 0;
+BEGIN
+    FOR rec IN
+        SELECT id, importance, access_count, promote_to_long_term
+        FROM working_memory
+        WHERE expiry < CURRENT_TIMESTAMP
+    LOOP
+        IF COALESCE(rec.promote_to_long_term, false)
+           OR COALESCE(rec.importance, 0) >= COALESCE(p_min_importance_to_promote, 0.75)
+           OR COALESCE(rec.access_count, 0) >= COALESCE(p_min_accesses_to_promote, 3)
+        THEN
+            promoted := array_append(promoted, promote_working_memory_to_episodic(rec.id, rec.importance));
+        END IF;
+    END LOOP;
+
+    WITH deleted AS (
+        DELETE FROM working_memory
+        WHERE expiry < CURRENT_TIMESTAMP
+        RETURNING 1
+    )
+    SELECT COUNT(*) INTO deleted_count FROM deleted;
+
+    RETURN jsonb_build_object(
+        'deleted_count', COALESCE(deleted_count, 0),
+        'promoted_count', COALESCE(array_length(promoted, 1), 0),
+        'promoted_ids', COALESCE(to_jsonb(promoted), '[]'::jsonb)
+    );
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION cleanup_working_memory()
 RETURNS INT AS $$
@@ -2081,6 +2189,8 @@ ORDER BY mn.computed_at ASC;
 COMMENT ON FUNCTION fast_recall IS 'Primary retrieval function combining vector similarity, precomputed associations, and temporal context. Hot path - optimized for speed.';
 
 COMMENT ON FUNCTION create_memory IS 'Creates a base memory record and corresponding graph node. Embedding must be pre-computed by application.';
+
+COMMENT ON FUNCTION create_memory_relationship IS 'Creates a typed edge between two memories in the graph. Used for causal chains, contradictions, etc.';
 
 COMMENT ON FUNCTION link_memory_to_concept IS 'Links a memory to an abstract concept, creating the concept if needed. Updates both relational and graph layers.';
 
@@ -3406,6 +3516,7 @@ COMMENT ON TABLE external_calls IS 'Queue for LLM and embedding API calls. Worke
 
 COMMENT ON FUNCTION should_run_heartbeat IS 'Check if heartbeat interval has elapsed and system is not paused.';
 COMMENT ON FUNCTION start_heartbeat IS 'Initialize heartbeat: regenerate energy, gather context, queue think request.';
+COMMENT ON FUNCTION execute_heartbeat_action IS 'Execute a single action, deducting energy and returning results.';
 COMMENT ON FUNCTION complete_heartbeat IS 'Finalize heartbeat: create episodic memory, update log, set next heartbeat time.';
 COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision: environment, goals, memories, identity, worldview, energy.';
 
@@ -4172,10 +4283,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION public.find_contradictions(p_memory_id uuid DEFAULT NULL::uuid)
- RETURNS TABLE(memory_a uuid, memory_b uuid, content_a text, content_b text)
- LANGUAGE plpgsql
-AS $function$
+CREATE OR REPLACE FUNCTION find_contradictions(p_memory_id UUID DEFAULT NULL)
+RETURNS TABLE (
+    memory_a UUID,
+    memory_b UUID,
+    content_a TEXT,
+    content_b TEXT
+) AS $$
 DECLARE
     filter_clause TEXT;
     sql TEXT;
@@ -4213,7 +4327,7 @@ BEGIN
             RETURN;
     END;
 END;
-$function$;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION find_causal_chain(p_memory_id UUID, p_depth INT DEFAULT 3)
 RETURNS TABLE (
@@ -4687,8 +4801,7 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN
   RAISE EXCEPTION 'create_memory_relationship failed: % | generated query: %', SQLERRM, qry;
 END;
-$function$;
-COMMENT ON FUNCTION create_memory_relationship IS 'Creates a typed edge between two memories in the graph. Used for causal chains, contradictions, etc.';
+$function$
 
 CREATE OR REPLACE FUNCTION public.execute_heartbeat_action(p_heartbeat_id uuid, p_action text, p_params jsonb DEFAULT '{}'::jsonb)
  RETURNS jsonb
@@ -4988,7 +5101,4 @@ BEGIN
         'result', result
     );
 END;
-$function$;
-COMMENT ON FUNCTION execute_heartbeat_action IS 'Execute a single action, deducting energy and returning results.';
-
-SET search_path = ag_catalog, "$user", public;
+$function$

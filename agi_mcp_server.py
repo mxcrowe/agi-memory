@@ -267,7 +267,7 @@ async def _dispatch_tool(
     if name == "get_goals":
         pri = args.get("priority")
         gp: GoalPriority | None = GoalPriority(pri) if pri else None
-        return await client.get_goals(gp)
+        return await client.get_goals(priority=gp)
 
     if name == "batch":
         ops = _require(args, "operations", name) or []

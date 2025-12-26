@@ -24,7 +24,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 from prompt_resources import compose_personhood_prompt
 
 logging.getLogger(__name__).warning(
-    "🚨 HEARTBEAT WORKER STARTUP MARKER v2025-12-23T18:45Z 🚨"
+    f"🚨 HEARTBEAT WORKER STARTUP MARKER {datetime.now(timezone.utc).isoformat(timespec='seconds')}Z 🚨"
 )
 
 # Optional: Import LLM clients
