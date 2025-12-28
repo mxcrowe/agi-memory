@@ -1,0 +1,37 @@
+agi_heartbeat_worker  | 2025-12-24 03:14:10,893 - heartbeat_worker - INFO - Starting heartbeat...
+agi_heartbeat_worker  | 2025-12-24 03:14:10,900 - heartbeat_worker - INFO - Heartbeat started: 8806962a-913f-44d7-8514-b879123262b8
+agi_heartbeat_worker  | 2025-12-24 03:14:11,904 - heartbeat_worker - INFO - Processing think call: e9451e8d-e5cc-4644-8a54-42dec3ac5352
+agi_heartbeat_worker  | 2025-12-24 03:14:34,796 - httpx - INFO - HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+agi_heartbeat_worker  | 2025-12-24 03:15:10,057 - httpx - INFO - HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+agi_heartbeat_worker  | 2025-12-24 03:15:10,059 - heartbeat_worker - ERROR - Error processing call e9451e8d-e5cc-4644-8a54-42dec3ac5352: syntax error at or near "]"
+agi_heartbeat_worker  | Traceback (most recent call last):
+agi_heartbeat_worker  |   File "/usr/local/lib/python3.12/site-packages/worker.py", line 1291, in run
+agi_heartbeat_worker  |     await self.execute_heartbeat_actions(
+agi_heartbeat_worker  |   File "/usr/local/lib/python3.12/site-packages/worker.py", line 972, in execute_heartbeat_actions
+agi_heartbeat_worker  |     result = await conn.fetchval(
+agi_heartbeat_worker  |              ^^^^^^^^^^^^^^^^^^^^
+agi_heartbeat_worker  |   File "/usr/local/lib/python3.12/site-packages/asyncpg/connection.py", line 718, in fetchval
+agi_heartbeat_worker  |     data = await self._execute(query, args, 1, timeout)
+agi_heartbeat_worker  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agi_heartbeat_worker  |   File "/usr/local/lib/python3.12/site-packages/asyncpg/connection.py", line 1873, in _execute
+agi_heartbeat_worker  |     result, _ = await self.__execute(
+agi_heartbeat_worker  |                 ^^^^^^^^^^^^^^^^^^^^^
+agi_heartbeat_worker  |   File "/usr/local/lib/python3.12/site-packages/asyncpg/connection.py", line 1970, in __execute
+agi_heartbeat_worker  |     result, stmt = await self._do_execute(
+agi_heartbeat_worker  |                    ^^^^^^^^^^^^^^^^^^^^^^^
+agi_heartbeat_worker  |   File "/usr/local/lib/python3.12/site-packages/asyncpg/connection.py", line 2033, in _do_execute
+agi_heartbeat_worker  |     result = await executor(stmt, None)
+agi_heartbeat_worker  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+agi_heartbeat_worker  |   File "asyncpg/protocol/protocol.pyx", line 205, in bind_execute
+agi_heartbeat_worker  | asyncpg.exceptions.PostgresSyntaxError: syntax error at or near "]"
+agi_heartbeat_worker  | 2025-12-24 03:15:10,063 - heartbeat_worker - ERROR - PG DETAIL: None
+agi_heartbeat_worker  | 2025-12-24 03:15:10,063 - heartbeat_worker - ERROR - PG CONTEXT: PL/pgSQL function create_memory_relationship(uuid,uuid,graph_edge_type,jsonb) line 3 at EXECUTE
+agi_heartbeat_worker  | SQL statement "SELECT create_memory_relationship(
+agi_heartbeat_worker  |                 (p_params->>'from_id')::UUID,
+agi_heartbeat_worker  |                 (p_params->>'to_id')::UUID,
+agi_heartbeat_worker  |                 (p_params->>'relationship_type')::graph_edge_type,
+agi_heartbeat_worker  |                 COALESCE(p_params->'properties', '{}'::jsonb)
+agi_heartbeat_worker  |             )"
+agi_heartbeat_worker  | PL/pgSQL function execute_heartbeat_action(uuid,text,jsonb) line 78 at PERFORM
+agi_heartbeat_worker  | 2025-12-24 03:15:10,063 - heartbeat_worker - ERROR - PG HINT: None
+agi_heartbeat_worker  | 2025-12-24 03:15:10,063 - heartbeat_worker - ERROR - Worker loop error: syntax error at or near "]"

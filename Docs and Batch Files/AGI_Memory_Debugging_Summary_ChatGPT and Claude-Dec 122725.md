@@ -264,7 +264,11 @@ Constraints:
 - Must remain evidence-driven: measure cost per heartbeat and error rate before/after.
 - Keep changes isolated behind a single client/module so the worker logic stays stable.
 
----
+## Future Upgrade: Windows Desktop Dashboard (Idea)
+
+Goal: Create a Windows app that shows live heartbeat activity, recent memories, goals, drives, emotional state - all updating in real-time. Could be a simple Python/Tkinter app or something fancier with Electron. 
+
+--
 
 ## Hardening Ingestion Discipline (Dec 2025)
 
@@ -763,3 +767,49 @@ Allows connect actions to use semantic labels (not just UUIDs). Falls back throu
 
 ### Status
 Core read/write paths validated. System ready for deliberate population or heartbeat testing.
+
+---
+
+## 2025-12-27 (Evening) — Phase II.b: Heartbeat Testing & Semantic Resolution (Koan / Claude)
+
+### Context
+With core system validated, enabled heartbeat for autonomous operation. Discovered semantic resolution gaps when heartbeat LLM reasoned with abstract concepts instead of UUIDs.
+
+### Heartbeat Results
+- **11 heartbeats** completed successfully
+- **55+ memories** generated organically
+- System demonstrated metacognition:
+  - Self-diagnosed connect failures as "parameter validation issues"
+  - Tracked own emotional valence patterns
+  - Noted "System has achieved operational rhythm"
+  - Connected failures to worldview belief about graceful degradation
+
+### Issues Discovered & Fixed
+
+**1. Connect action - abstract concepts**
+- Heartbeat tried: `{"concept_a": "validation test outcomes", "concept_b": "debugging priority areas"}`
+- Expected: UUIDs
+- Fix: Added vector similarity fallback to `resolve_memory_reference()` (threshold 0.25)
+
+**2. Reprioritize action - goal titles vs UUIDs**
+- Heartbeat tried: `{"goal": "Identify next debugging priorities"}`
+- Expected: `goal_id` with UUID
+- Fix: Created `resolve_goal_reference()` function + accept both `goal_id` and `goal` keys
+
+### New Functions Added
+- `resolve_memory_reference()` — now with vector similarity fallback (Strategy 4)
+- `resolve_goal_reference()` — title/description matching for goals
+
+### Schema Changes
+- `resolve_memory_reference()` enhanced with vector fallback
+- `resolve_goal_reference()` added
+- `execute_heartbeat_action` reprioritize block updated
+
+### Key Insight
+The heartbeat LLM reasons at a conceptual level. Rather than constraining it to output UUIDs, we built smarter resolution layers that bridge abstract reasoning to concrete entities. This preserves creative association while grounding it in the memory graph.
+
+### Backups
+- `agi_db_phase2_organic_55mem_20251227.dump` — 55 organically-generated memories before wipe
+
+### Next: Phase III - Dev Team Member
+Decision made to wipe and repopulate with intentional seed data orienting agi-mem as a *development team member* rather than test subject. Goals derived from Eric's test plan, identity as collaborative developer.

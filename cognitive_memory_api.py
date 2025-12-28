@@ -547,6 +547,27 @@ class CognitiveMemory:
                     r.context,
                 )
 
+    async def resolve_memory_reference(self, ref: str) -> UUID | None:
+        """
+        Resolve a memory reference that may be UUID or semantic label.
+        
+        Uses the DB function resolve_memory_reference() which tries:
+        1. Direct UUID parse (if valid UUID format)
+        2. Exact content match
+        3. Partial content match
+        
+        Returns UUID if found, None otherwise.
+        """
+        if not ref or not ref.strip():
+            return None
+        
+        async with self._pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT resolve_memory_reference($1)",
+                ref.strip()
+            )
+            return UUID(str(result)) if result else None
+
     async def find_causes(self, memory_id: UUID, *, depth: int = 3) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM find_causal_chain($1::uuid, $2::int)", memory_id, depth)

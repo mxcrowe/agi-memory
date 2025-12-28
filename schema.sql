@@ -827,6 +827,152 @@ CREATE TRIGGER trg_auto_episode_assignment
 -- ============================================================================
 
 -- Fast recall: Primary retrieval function (Hot Path)
+-- Resolve memory reference: UUID or semantic label -> UUID
+-- Added: 2025-12-27 for P3 connect action semantic resolution
+-- Resolve memory reference: UUID, semantic label, or abstract concept -> UUID
+-- Added: 2025-12-27 for connect action semantic resolution
+-- Enhanced: 2025-12-27 with vector similarity fallback for abstract concepts
+CREATE OR REPLACE FUNCTION resolve_memory_reference(p_ref TEXT)
+RETURNS UUID AS $$
+DECLARE
+    v_uuid UUID;
+    v_found_id UUID;
+    v_query_embedding vector;
+    v_similarity FLOAT;
+    v_similarity_threshold FLOAT := 0.25;  -- Minimum similarity to accept
+BEGIN
+    -- Return NULL for empty/null input
+    IF p_ref IS NULL OR btrim(p_ref) = '' THEN
+        RETURN NULL;
+    END IF;
+
+    -- Strategy 1: Try direct UUID parse first
+    v_uuid := public.try_uuid(p_ref);
+    IF v_uuid IS NOT NULL THEN
+        -- Verify it exists in memories table
+        SELECT id INTO v_found_id FROM memories WHERE id = v_uuid AND status = 'active' LIMIT 1;
+        IF v_found_id IS NOT NULL THEN
+            RETURN v_found_id;
+        END IF;
+    END IF;
+
+    -- Strategy 2: Exact content match (case-insensitive)
+    SELECT id INTO v_found_id 
+    FROM memories 
+    WHERE status = 'active' 
+      AND lower(content) = lower(btrim(p_ref))
+    ORDER BY importance DESC, created_at DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 3: Partial content match (content contains reference)
+    SELECT id INTO v_found_id 
+    FROM memories 
+    WHERE status = 'active' 
+      AND lower(content) LIKE '%' || lower(btrim(p_ref)) || '%'
+    ORDER BY importance DESC, created_at DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 4: Vector similarity search (semantic matching)
+    -- This allows abstract concepts like "validation test outcomes" to find
+    -- the closest matching memory even without exact string overlap
+    BEGIN
+        v_query_embedding := get_embedding(btrim(p_ref));
+        
+        IF v_query_embedding IS NOT NULL THEN
+            SELECT 
+                id,
+                1 - (embedding <=> v_query_embedding) as similarity
+            INTO v_found_id, v_similarity
+            FROM memories
+            WHERE status = 'active'
+              AND embedding IS NOT NULL
+            ORDER BY embedding <=> v_query_embedding
+            LIMIT 1;
+            
+            -- Only return if similarity exceeds threshold
+            IF v_similarity >= v_similarity_threshold THEN
+                RETURN v_found_id;
+            END IF;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- If embedding service fails, return NULL gracefully
+        RETURN NULL;
+    END;
+    
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION resolve_memory_reference(TEXT) IS 
+'Resolves a memory reference (UUID, content string, or abstract concept) to a memory ID.
+Resolution strategy: 1) UUID parse, 2) Exact match, 3) Partial match, 4) Vector similarity (threshold: 0.25).';
+
+-- Resolve goal reference: UUID or title -> UUID
+-- Added: 2025-12-27 for reprioritize action semantic resolution
+CREATE OR REPLACE FUNCTION resolve_goal_reference(p_ref TEXT)
+RETURNS UUID AS $$
+DECLARE
+    v_uuid UUID;
+    v_found_id UUID;
+BEGIN
+    IF p_ref IS NULL OR btrim(p_ref) = '' THEN
+        RETURN NULL;
+    END IF;
+
+    -- Strategy 1: Direct UUID parse
+    v_uuid := public.try_uuid(p_ref);
+    IF v_uuid IS NOT NULL THEN
+        SELECT id INTO v_found_id FROM goals WHERE id = v_uuid LIMIT 1;
+        IF v_found_id IS NOT NULL THEN
+            RETURN v_found_id;
+        END IF;
+    END IF;
+
+    -- Strategy 2: Exact title match
+    SELECT id INTO v_found_id 
+    FROM goals 
+    WHERE lower(title) = lower(btrim(p_ref))
+    ORDER BY last_touched DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 3: Partial title match
+    SELECT id INTO v_found_id 
+    FROM goals 
+    WHERE lower(title) LIKE '%' || lower(btrim(p_ref)) || '%'
+    ORDER BY last_touched DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 4: Partial description match
+    SELECT id INTO v_found_id 
+    FROM goals 
+    WHERE lower(description) LIKE '%' || lower(btrim(p_ref)) || '%'
+    ORDER BY last_touched DESC
+    LIMIT 1;
+    
+    RETURN v_found_id;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION resolve_goal_reference(TEXT) IS 
+'Resolves a goal reference (UUID or title) to a goal ID.
+Resolution strategy: 1) UUID parse, 2) Exact title, 3) Partial title, 4) Partial description.';
+
 CREATE OR REPLACE FUNCTION fast_recall(
     p_query_text TEXT,
     p_limit INT DEFAULT 10
@@ -4773,21 +4919,31 @@ BEGIN
             DECLARE
                 v_from uuid;
                 v_to uuid;
+                v_from_raw text;
+                v_to_raw text;
                 v_rel_text text;
                 v_rel graph_edge_type;
             BEGIN
-                v_from := public.try_uuid(p_params->>'from_id');
-                v_to   := public.try_uuid(p_params->>'to_id');
+                v_from_raw := p_params->>'from_id';
+                v_to_raw := p_params->>'to_id';
+                
+                -- Try to resolve references (UUID or semantic label)
+                v_from := resolve_memory_reference(v_from_raw);
+                v_to := resolve_memory_reference(v_to_raw);
                 v_rel_text := NULLIF(btrim(COALESCE(p_params->>'relationship_type','')), '');
 
-                -- Reject + salvage: invalid/missing IDs or relationship_type
+                -- Reject + salvage: could not resolve IDs or missing relationship_type
                 IF v_from IS NULL OR v_to IS NULL OR v_rel_text IS NULL THEN
                     remembered_id := create_episodic_memory(
-                        p_content := 'Rejected connect proposal (invalid params). Raw: ' || COALESCE(p_params::text, '{}'),
+                        p_content := 'Rejected connect proposal (unresolved references). Raw: ' || COALESCE(p_params::text, '{}'),
                         p_context := jsonb_build_object(
                             'kind','ingestion_reject',
                             'action','connect',
-                            'reason','Invalid connect params',
+                            'reason','Unresolved memory references',
+                            'from_raw', COALESCE(v_from_raw, '<missing>'),
+                            'to_raw', COALESCE(v_to_raw, '<missing>'),
+                            'from_resolved', v_from IS NOT NULL,
+                            'to_resolved', v_to IS NOT NULL,
                             'heartbeat_id', p_heartbeat_id
                         ),
                         p_emotional_valence := 0,
@@ -4796,12 +4952,14 @@ BEGIN
 
                     RETURN jsonb_build_object(
                         'success', false,
-                        'error', 'Invalid connect params',
+                        'error', 'Unresolved memory references',
                         'salvaged_memory_id', remembered_id,
                         'details', jsonb_build_object(
-                            'from_id', COALESCE(p_params->>'from_id','<missing>'),
-                            'to_id', COALESCE(p_params->>'to_id','<missing>'),
-                            'relationship_type', COALESCE(p_params->>'relationship_type','<missing>')
+                            'from_raw', COALESCE(v_from_raw,'<missing>'),
+                            'to_raw', COALESCE(v_to_raw,'<missing>'),
+                            'from_resolved', v_from,
+                            'to_resolved', v_to,
+                            'relationship_type', COALESCE(v_rel_text,'<missing>')
                         )
                     );
                 END IF;
@@ -4838,20 +4996,61 @@ BEGIN
                     v_rel,
                     COALESCE(p_params->'properties', '{}'::jsonb)
                 );
-                result := jsonb_build_object('connected', true);
+                result := jsonb_build_object(
+                    'connected', true,
+                    'from_id', v_from,
+                    'to_id', v_to,
+                    'resolved_from', v_from_raw,
+                    'resolved_to', v_to_raw
+                );
                 PERFORM satisfy_drive('coherence', 0.1);
             END;
 
         WHEN 'reprioritize' THEN
-            PERFORM change_goal_priority(
-                (p_params->>'goal_id')::UUID,
-                (p_params->>'new_priority')::goal_priority,
-                p_params->>'reason'
-            );
-            IF (p_params->>'new_priority') = 'completed' THEN
-                PERFORM satisfy_drive('competence', 0.4);
-            END IF;
-            result := jsonb_build_object('reprioritized', true);
+            DECLARE
+                v_goal_id UUID;
+                v_goal_raw TEXT;
+            BEGIN
+                -- Accept both 'goal_id' and 'goal' keys (LLM sometimes uses either)
+                v_goal_raw := COALESCE(p_params->>'goal_id', p_params->>'goal');
+                v_goal_id := resolve_goal_reference(v_goal_raw);
+                
+                IF v_goal_id IS NULL THEN
+                    -- Salvage the intent
+                    remembered_id := create_episodic_memory(
+                        p_content := 'Rejected reprioritize (unresolved goal). Raw: ' || COALESCE(p_params::text, '{}'),
+                        p_context := jsonb_build_object(
+                            'kind', 'ingestion_reject',
+                            'action', 'reprioritize',
+                            'reason', 'Unresolved goal reference',
+                            'goal_raw', COALESCE(v_goal_raw, '<missing>'),
+                            'heartbeat_id', p_heartbeat_id
+                        ),
+                        p_emotional_valence := 0,
+                        p_importance := 0.2
+                    );
+                    RETURN jsonb_build_object(
+                        'success', false,
+                        'error', 'Unresolved goal reference',
+                        'salvaged_memory_id', remembered_id,
+                        'goal_raw', v_goal_raw
+                    );
+                END IF;
+                
+                PERFORM change_goal_priority(
+                    v_goal_id,
+                    (p_params->>'new_priority')::goal_priority,
+                    p_params->>'reason'
+                );
+                IF (p_params->>'new_priority') = 'completed' THEN
+                    PERFORM satisfy_drive('competence', 0.4);
+                END IF;
+                result := jsonb_build_object(
+                    'reprioritized', true,
+                    'goal_id', v_goal_id,
+                    'resolved_from', v_goal_raw
+                );
+            END;
 
         WHEN 'reflect' THEN
             INSERT INTO external_calls (call_type, input, heartbeat_id)
