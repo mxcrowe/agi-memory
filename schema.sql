@@ -839,7 +839,7 @@ DECLARE
     v_found_id UUID;
     v_query_embedding vector;
     v_similarity FLOAT;
-    v_similarity_threshold FLOAT := 0.25;  -- Minimum similarity to accept
+    v_similarity_threshold FLOAT := 0.18;  -- Lowered from 0.25 to catch abstract concepts
 BEGIN
     -- Return NULL for empty/null input
     IF p_ref IS NULL OR btrim(p_ref) = '' THEN
@@ -913,7 +913,7 @@ $$ LANGUAGE plpgsql STABLE;
 
 COMMENT ON FUNCTION resolve_memory_reference(TEXT) IS 
 'Resolves a memory reference (UUID, content string, or abstract concept) to a memory ID.
-Resolution strategy: 1) UUID parse, 2) Exact match, 3) Partial match, 4) Vector similarity (threshold: 0.25).';
+Resolution strategy: 1) UUID parse, 2) Exact match, 3) Partial match, 4) Vector similarity (threshold: 0.18).';
 
 -- Resolve goal reference: UUID or title -> UUID
 -- Added: 2025-12-27 for reprioritize action semantic resolution
@@ -3064,6 +3064,7 @@ RETURNS JSONB AS $$
 DECLARE
     last_user TIMESTAMPTZ;
     pending_count INT;
+    user_local TIMESTAMPTZ;
 BEGIN
     SELECT last_user_contact INTO last_user FROM heartbeat_state WHERE id = 1;
 
@@ -3072,15 +3073,21 @@ BEGIN
     FROM external_calls
     WHERE status = 'pending';
 
+    -- Michael is in Pacific time (UTC-8)
+    user_local := CURRENT_TIMESTAMP AT TIME ZONE 'America/Los_Angeles';
+
     RETURN jsonb_build_object(
         'timestamp', CURRENT_TIMESTAMP,
+        'user_timezone', 'America/Los_Angeles',
+        'user_local_time', to_char(user_local, 'HH24:MI'),
+        'user_local_day', to_char(user_local, 'Day'),
         'time_since_user_hours', CASE
             WHEN last_user IS NULL THEN NULL
             ELSE EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_user)) / 3600
         END,
         'pending_events', pending_count,
-        'day_of_week', EXTRACT(DOW FROM CURRENT_TIMESTAMP),
-        'hour_of_day', EXTRACT(HOUR FROM CURRENT_TIMESTAMP)
+        'day_of_week', EXTRACT(DOW FROM user_local),
+        'hour_of_day', EXTRACT(HOUR FROM user_local)
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -4141,7 +4148,7 @@ ORDER BY hour DESC;
 CREATE OR REPLACE FUNCTION recompute_neighborhood(
     p_memory_id UUID,
     p_neighbor_count INT DEFAULT 20,
-    p_min_similarity FLOAT DEFAULT 0.5
+    p_min_similarity FLOAT DEFAULT 0.35  -- Lowered from 0.5; revisit when memory count > 200
 )
 RETURNS VOID AS $$
 DECLARE
@@ -4582,7 +4589,27 @@ BEGIN
             BEGIN
                 from_id := NULLIF(rel->>'from_id', '')::uuid;
                 to_id := NULLIF(rel->>'to_id', '')::uuid;
-                rel_type := (rel->>'type')::graph_edge_type;
+                
+                -- Map LLM relationship types to valid enum values
+                rel_type := CASE LOWER(rel->>'type')
+                    WHEN 'resolves' THEN 'DERIVED_FROM'
+                    WHEN 'diagnosis_of' THEN 'DERIVED_FROM'
+                    WHEN 'fulfilled_by' THEN 'SUPPORTS'
+                    WHEN 'led_to' THEN 'CAUSES'
+                    WHEN 'contextualizes' THEN 'ASSOCIATED'
+                    WHEN 'leads_to' THEN 'CAUSES'
+                    WHEN 'temporal_sequence' THEN 'TEMPORAL_NEXT'
+                    WHEN 'related_to' THEN 'ASSOCIATED'
+                    WHEN 'supports' THEN 'SUPPORTS'
+                    WHEN 'contradicts' THEN 'CONTRADICTS'
+                    WHEN 'causes' THEN 'CAUSES'
+                    WHEN 'derived_from' THEN 'DERIVED_FROM'
+                    WHEN 'instance_of' THEN 'INSTANCE_OF'
+                    WHEN 'parent_of' THEN 'PARENT_OF'
+                    WHEN 'associated' THEN 'ASSOCIATED'
+                    ELSE 'ASSOCIATED'  -- fallback for unknown types
+                END::graph_edge_type;
+                
                 rel_conf := COALESCE((rel->>'confidence')::float, 0.8);
                 IF from_id IS NOT NULL AND to_id IS NOT NULL THEN
                     PERFORM discover_relationship(from_id, to_id, rel_type, rel_conf, 'reflection', p_heartbeat_id, 'reflect');
@@ -4797,7 +4824,7 @@ BEGIN
   END IF;
 
   IF p_properties IS NULL OR p_properties = '{}'::jsonb THEN
-    props_text := '';
+    props_text := '{}';
   ELSE
     SELECT string_agg(
       CASE
@@ -4819,13 +4846,14 @@ BEGIN
   qry := format(
     'SELECT * FROM cypher(''memory_graph'', $q$
       MATCH (a:MemoryNode {memory_id: %L}), (b:MemoryNode {memory_id: %L})
-      CREATE (a)-[r:%s %s]->(b)
+      MERGE (a)-[r:%s]->(b)
+      SET r += %s
       RETURN r
     $q$) as (result agtype)',
     p_from_id,
     p_to_id,
     rel_token,
-    COALESCE(props_text, '')
+    props_text
   );
 
   EXECUTE qry;
