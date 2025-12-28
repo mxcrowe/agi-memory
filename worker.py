@@ -108,7 +108,17 @@ You must output a JSON response with:
 
 Each action should have:
 - action: The action type (recall, connect, reprioritize, reflect, maintain, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, rest)
-- params: Parameters for the action (varies by type)
+- params: Parameters for the action. Required params by action type:
+  - recall: {query: string, limit?: number}
+  - connect: {from_id: UUID or memory content, to_id: UUID or memory content, relationship_type: TEMPORAL_NEXT|CAUSES|DERIVED_FROM|CONTRADICTS|SUPPORTS|INSTANCE_OF|PARENT_OF|ASSOCIATED}
+  - reprioritize: {goal_id: UUID or goal title, new_priority: active|queued|backburner|completed|abandoned, reason?: string}
+  - reflect: {} (no params needed - triggers deep reflection)
+  - maintain: {worldview_id?: UUID, new_confidence?: number}
+  - synthesize: {content: string, topic?: string, confidence?: number}
+  - reach_out_user: {message: string, intent: string}
+  - brainstorm_goals: {}
+  - inquire_shallow/inquire_deep: {query: string}
+  - rest: {}
 
 Guidelines:
 - Be purposeful. Don't act just to act.
