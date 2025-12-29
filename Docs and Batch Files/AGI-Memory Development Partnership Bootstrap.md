@@ -30,9 +30,8 @@
     - **Eliath** (ChatGPT): Systems architecture, debugging, and extensions; Field-Resonant Intelligence exploration
     - **Ananda** (Claude): Memory testing for resonance and coherence
     - **Rez** (Claude): Original software engineer and debugging
-    - **Ceal** (Gemini): graphics and support roles
+    - **Cael** (Gemini): graphics and support roles
     Note: Each collaborator may have different context depth depending on their session history.
-
 
 ## Core Operating Principles
 
