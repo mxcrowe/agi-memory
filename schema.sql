@@ -158,6 +158,16 @@ CREATE TABLE ingestion_receipts (
 
 CREATE INDEX idx_ingestion_receipts_hash ON ingestion_receipts (content_hash);
 
+CREATE OR REPLACE FUNCTION try_uuid(p_text TEXT)
+RETURNS UUID AS $$
+BEGIN
+    RETURN p_text::UUID;
+EXCEPTION
+    WHEN invalid_text_representation THEN
+        RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 CREATE OR REPLACE FUNCTION get_ingestion_receipts(
     p_source_file TEXT,
     p_content_hashes TEXT[]
