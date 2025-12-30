@@ -1,0 +1,12 @@
+local-memory-system/
+├── README.md                 # ✅ New minimal root readme
+├── schema.sql                # Main schema (synced with DB)
+├── worker.py                 # Heartbeat worker (updated)
+├── cognitive_memory_api.py   # API (bug fixed)
+├── *.py                      # Other Python modules
+├── Batch Files/              # All batch scripts + icons
+├── Documentation/            # All docs consolidated
+├── backups/                  # DB dumps only
+├── db/migrations/            # SQL patches and schema history
+├── prompts/                  # Personhood prompts (used by code)
+└── reference/                # Eric's design rationale (quirks.md, AGE docs)

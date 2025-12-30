@@ -187,8 +187,18 @@ async def _dispatch_tool(
         )
 
     if name == "connect":
-        from_id = UUID(_require(args, "from_id", name))
-        to_id = UUID(_require(args, "to_id", name))
+        from_raw = _require(args, "from_id", name)
+        to_raw = _require(args, "to_id", name)
+        
+        # Resolve semantic references via DB function
+        from_id = await client.resolve_memory_reference(from_raw)
+        to_id = await client.resolve_memory_reference(to_raw)
+        
+        if from_id is None:
+            raise ValueError(f"Could not resolve 'from_id': {from_raw}")
+        if to_id is None:
+            raise ValueError(f"Could not resolve 'to_id': {to_raw}")
+        
         rel = RelationshipType(_require(args, "relationship", name))
         await client.connect_memories(
             from_id,
@@ -197,7 +207,7 @@ async def _dispatch_tool(
             confidence=float(args.get("confidence", 0.8)),
             context=args.get("context"),
         )
-        return {"ok": True}
+        return {"ok": True, "from_id": str(from_id), "to_id": str(to_id)}
 
     if name == "connect_batch":
         items = _require(args, "relationships", name)
@@ -267,7 +277,7 @@ async def _dispatch_tool(
     if name == "get_goals":
         pri = args.get("priority")
         gp: GoalPriority | None = GoalPriority(pri) if pri else None
-        return await client.get_goals(gp)
+        return await client.get_goals(priority=gp)
 
     if name == "batch":
         ops = _require(args, "operations", name) or []

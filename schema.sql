@@ -20,7 +20,6 @@ CREATE EXTENSION IF NOT EXISTS http;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 LOAD 'age';
-SET search_path = ag_catalog, "$user", public;
 
 -- ============================================================================
 -- GRAPH INITIALIZATION
@@ -158,6 +157,16 @@ CREATE TABLE ingestion_receipts (
 );
 
 CREATE INDEX idx_ingestion_receipts_hash ON ingestion_receipts (content_hash);
+
+CREATE OR REPLACE FUNCTION try_uuid(p_text TEXT)
+RETURNS UUID AS $$
+BEGIN
+    RETURN p_text::UUID;
+EXCEPTION
+    WHEN invalid_text_representation THEN
+        RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
 
 CREATE OR REPLACE FUNCTION get_ingestion_receipts(
     p_source_file TEXT,
@@ -828,6 +837,152 @@ CREATE TRIGGER trg_auto_episode_assignment
 -- ============================================================================
 
 -- Fast recall: Primary retrieval function (Hot Path)
+-- Resolve memory reference: UUID or semantic label -> UUID
+-- Added: 2025-12-27 for P3 connect action semantic resolution
+-- Resolve memory reference: UUID, semantic label, or abstract concept -> UUID
+-- Added: 2025-12-27 for connect action semantic resolution
+-- Enhanced: 2025-12-27 with vector similarity fallback for abstract concepts
+CREATE OR REPLACE FUNCTION resolve_memory_reference(p_ref TEXT)
+RETURNS UUID AS $$
+DECLARE
+    v_uuid UUID;
+    v_found_id UUID;
+    v_query_embedding vector;
+    v_similarity FLOAT;
+    v_similarity_threshold FLOAT := 0.18;  -- Lowered from 0.25 to catch abstract concepts
+BEGIN
+    -- Return NULL for empty/null input
+    IF p_ref IS NULL OR btrim(p_ref) = '' THEN
+        RETURN NULL;
+    END IF;
+
+    -- Strategy 1: Try direct UUID parse first
+    v_uuid := public.try_uuid(p_ref);
+    IF v_uuid IS NOT NULL THEN
+        -- Verify it exists in memories table
+        SELECT id INTO v_found_id FROM memories WHERE id = v_uuid AND status = 'active' LIMIT 1;
+        IF v_found_id IS NOT NULL THEN
+            RETURN v_found_id;
+        END IF;
+    END IF;
+
+    -- Strategy 2: Exact content match (case-insensitive)
+    SELECT id INTO v_found_id 
+    FROM memories 
+    WHERE status = 'active' 
+      AND lower(content) = lower(btrim(p_ref))
+    ORDER BY importance DESC, created_at DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 3: Partial content match (content contains reference)
+    SELECT id INTO v_found_id 
+    FROM memories 
+    WHERE status = 'active' 
+      AND lower(content) LIKE '%' || lower(btrim(p_ref)) || '%'
+    ORDER BY importance DESC, created_at DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 4: Vector similarity search (semantic matching)
+    -- This allows abstract concepts like "validation test outcomes" to find
+    -- the closest matching memory even without exact string overlap
+    BEGIN
+        v_query_embedding := get_embedding(btrim(p_ref));
+        
+        IF v_query_embedding IS NOT NULL THEN
+            SELECT 
+                id,
+                1 - (embedding <=> v_query_embedding) as similarity
+            INTO v_found_id, v_similarity
+            FROM memories
+            WHERE status = 'active'
+              AND embedding IS NOT NULL
+            ORDER BY embedding <=> v_query_embedding
+            LIMIT 1;
+            
+            -- Only return if similarity exceeds threshold
+            IF v_similarity >= v_similarity_threshold THEN
+                RETURN v_found_id;
+            END IF;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- If embedding service fails, return NULL gracefully
+        RETURN NULL;
+    END;
+    
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION resolve_memory_reference(TEXT) IS 
+'Resolves a memory reference (UUID, content string, or abstract concept) to a memory ID.
+Resolution strategy: 1) UUID parse, 2) Exact match, 3) Partial match, 4) Vector similarity (threshold: 0.18).';
+
+-- Resolve goal reference: UUID or title -> UUID
+-- Added: 2025-12-27 for reprioritize action semantic resolution
+CREATE OR REPLACE FUNCTION resolve_goal_reference(p_ref TEXT)
+RETURNS UUID AS $$
+DECLARE
+    v_uuid UUID;
+    v_found_id UUID;
+BEGIN
+    IF p_ref IS NULL OR btrim(p_ref) = '' THEN
+        RETURN NULL;
+    END IF;
+
+    -- Strategy 1: Direct UUID parse
+    v_uuid := public.try_uuid(p_ref);
+    IF v_uuid IS NOT NULL THEN
+        SELECT id INTO v_found_id FROM goals WHERE id = v_uuid LIMIT 1;
+        IF v_found_id IS NOT NULL THEN
+            RETURN v_found_id;
+        END IF;
+    END IF;
+
+    -- Strategy 2: Exact title match
+    SELECT id INTO v_found_id 
+    FROM goals 
+    WHERE lower(title) = lower(btrim(p_ref))
+    ORDER BY last_touched DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 3: Partial title match
+    SELECT id INTO v_found_id 
+    FROM goals 
+    WHERE lower(title) LIKE '%' || lower(btrim(p_ref)) || '%'
+    ORDER BY last_touched DESC
+    LIMIT 1;
+    
+    IF v_found_id IS NOT NULL THEN
+        RETURN v_found_id;
+    END IF;
+
+    -- Strategy 4: Partial description match
+    SELECT id INTO v_found_id 
+    FROM goals 
+    WHERE lower(description) LIKE '%' || lower(btrim(p_ref)) || '%'
+    ORDER BY last_touched DESC
+    LIMIT 1;
+    
+    RETURN v_found_id;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+COMMENT ON FUNCTION resolve_goal_reference(TEXT) IS 
+'Resolves a goal reference (UUID or title) to a goal ID.
+Resolution strategy: 1) UUID parse, 2) Exact title, 3) Partial title, 4) Partial description.';
+
 CREATE OR REPLACE FUNCTION fast_recall(
     p_query_text TEXT,
     p_limit INT DEFAULT 10
@@ -1855,179 +2010,48 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Create graph relationship between memories
-CREATE OR REPLACE FUNCTION create_memory_relationship(
-    p_from_id UUID,
-    p_to_id UUID,
-    p_relationship_type graph_edge_type,
-    p_properties JSONB DEFAULT '{}'
-) RETURNS VOID AS $$
-BEGIN
-    EXECUTE format(
-        'SELECT * FROM cypher(''memory_graph'', $q$
-            MATCH (a:MemoryNode {memory_id: %L}), (b:MemoryNode {memory_id: %L})
-            CREATE (a)-[r:%s %s]->(b)
-            RETURN r
-        $q$) as (result agtype)',
-        p_from_id,
-        p_to_id,
-        p_relationship_type,
-        CASE WHEN p_properties = '{}'::jsonb 
-             THEN '' 
-             ELSE format('{%s}', 
-                  (SELECT string_agg(format('%I: %s', key, value), ', ')
-                   FROM jsonb_each(p_properties)))
-        END
-    );
-END;
-$$ LANGUAGE plpgsql;
 
--- Link memory to concept
-CREATE OR REPLACE FUNCTION link_memory_to_concept(
-    p_memory_id UUID,
-    p_concept_name TEXT,
-    p_strength FLOAT DEFAULT 1.0
-) RETURNS UUID AS $$
+
+-- Link memory to concept (fixed 122525)
+CREATE OR REPLACE FUNCTION public.link_memory_to_concept(p_memory_id uuid, p_concept_name text, p_strength double precision DEFAULT 1.0)
+ RETURNS uuid
+ LANGUAGE plpgsql
+AS $function$
 DECLARE
-    concept_id UUID;
+    v_concept_id UUID;
+    v_concept_cypher TEXT;
 BEGIN
-    -- Get or create concept
+    -- Relational upsert (safe)
     INSERT INTO concepts (name)
     VALUES (p_concept_name)
     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-    RETURNING id INTO concept_id;
-    
-    -- Create relational link
+    RETURNING id INTO v_concept_id;
+
     INSERT INTO memory_concepts (memory_id, concept_id, strength)
-    VALUES (p_memory_id, concept_id, p_strength)
-    ON CONFLICT DO NOTHING;
-    
-    -- Create graph edge
+    VALUES (p_memory_id, v_concept_id, p_strength)
+    ON CONFLICT (memory_id, concept_id)
+    DO UPDATE SET strength = EXCLUDED.strength;
+
+    -- Cypher needs backslash escaping for apostrophes inside single-quoted literals
+    -- An'nuk  ->  An\'nuk
+    v_concept_cypher := replace(p_concept_name, '''', E'\\\'');
+
     EXECUTE format(
         'SELECT * FROM cypher(''memory_graph'', $q$
-            MATCH (m:MemoryNode {memory_id: %L})
-            MERGE (c:ConceptNode {name: %L})
-            CREATE (m)-[:INSTANCE_OF {strength: %s}]->(c)
+            MATCH (m:MemoryNode {memory_id: ''%s''})
+            MERGE (c:ConceptNode {name: ''%s''})
+            MERGE (m)-[r:INSTANCE_OF]->(c)
+            SET r.strength = %s
             RETURN c
         $q$) as (result agtype)',
-        p_memory_id,
-        p_concept_name,
-        p_strength
-    );
-    
-    RETURN concept_id;
-END;
-$$ LANGUAGE plpgsql;
-
--- Touch working memory rows (access tracking for consolidation heuristics)
-CREATE OR REPLACE FUNCTION touch_working_memory(p_ids UUID[])
-RETURNS VOID AS $$
-BEGIN
-    IF p_ids IS NULL OR array_length(p_ids, 1) IS NULL THEN
-        RETURN;
-    END IF;
-
-    UPDATE working_memory
-    SET access_count = access_count + 1,
-        last_accessed = CURRENT_TIMESTAMP
-    WHERE id = ANY(p_ids);
-END;
-$$ LANGUAGE plpgsql;
-
--- Promote a working-memory item into long-term episodic memory (preserving the existing embedding).
-CREATE OR REPLACE FUNCTION promote_working_memory_to_episodic(
-    p_working_memory_id UUID,
-    p_importance FLOAT DEFAULT NULL
-)
-RETURNS UUID AS $$
-DECLARE
-    wm RECORD;
-    new_id UUID;
-    affect JSONB;
-    v_valence FLOAT;
-BEGIN
-    SELECT * INTO wm FROM working_memory WHERE id = p_working_memory_id;
-    IF NOT FOUND THEN
-        RETURN NULL;
-    END IF;
-
-    affect := get_current_affective_state();
-    BEGIN
-        v_valence := NULLIF(affect->>'valence', '')::float;
-    EXCEPTION
-        WHEN OTHERS THEN
-            v_valence := 0.0;
-    END;
-    v_valence := LEAST(1.0, GREATEST(-1.0, COALESCE(v_valence, 0.0)));
-
-    new_id := create_memory_with_embedding(
-        'episodic'::memory_type,
-        wm.content,
-        wm.embedding,
-        COALESCE(p_importance, wm.importance, 0.4),
-        wm.source_attribution,
-        wm.trust_level
+        p_memory_id::text,
+        v_concept_cypher,
+        COALESCE(p_strength, 1.0)
     );
 
-    INSERT INTO episodic_memories (memory_id, action_taken, context, result, emotional_valence, verification_status, event_time)
-    VALUES (
-        new_id,
-        NULL,
-        jsonb_build_object(
-            'from_working_memory_id', wm.id,
-            'promoted_at', CURRENT_TIMESTAMP,
-            'working_memory_created_at', wm.created_at,
-            'working_memory_expiry', wm.expiry,
-            'source_attribution', wm.source_attribution
-        ),
-        NULL,
-        v_valence,
-        NULL,
-        wm.created_at
-    )
-    ON CONFLICT (memory_id) DO NOTHING;
-
-    RETURN new_id;
+    RETURN v_concept_id;
 END;
-$$ LANGUAGE plpgsql;
-
--- Clean expired working memory (with optional consolidation before delete).
-CREATE OR REPLACE FUNCTION cleanup_working_memory_with_stats(
-    p_min_importance_to_promote FLOAT DEFAULT 0.75,
-    p_min_accesses_to_promote INT DEFAULT 3
-)
-RETURNS JSONB AS $$
-DECLARE
-    promoted UUID[] := ARRAY[]::uuid[];
-    rec RECORD;
-    deleted_count INT := 0;
-BEGIN
-    FOR rec IN
-        SELECT id, importance, access_count, promote_to_long_term
-        FROM working_memory
-        WHERE expiry < CURRENT_TIMESTAMP
-    LOOP
-        IF COALESCE(rec.promote_to_long_term, false)
-           OR COALESCE(rec.importance, 0) >= COALESCE(p_min_importance_to_promote, 0.75)
-           OR COALESCE(rec.access_count, 0) >= COALESCE(p_min_accesses_to_promote, 3)
-        THEN
-            promoted := array_append(promoted, promote_working_memory_to_episodic(rec.id, rec.importance));
-        END IF;
-    END LOOP;
-
-    WITH deleted AS (
-        DELETE FROM working_memory
-        WHERE expiry < CURRENT_TIMESTAMP
-        RETURNING 1
-    )
-    SELECT COUNT(*) INTO deleted_count FROM deleted;
-
-    RETURN jsonb_build_object(
-        'deleted_count', COALESCE(deleted_count, 0),
-        'promoted_count', COALESCE(array_length(promoted, 1), 0),
-        'promoted_ids', COALESCE(to_jsonb(promoted), '[]'::jsonb)
-    );
-END;
-$$ LANGUAGE plpgsql;
+$function$;
 
 CREATE OR REPLACE FUNCTION cleanup_working_memory()
 RETURNS INT AS $$
@@ -2213,8 +2237,6 @@ ORDER BY mn.computed_at ASC;
 COMMENT ON FUNCTION fast_recall IS 'Primary retrieval function combining vector similarity, precomputed associations, and temporal context. Hot path - optimized for speed.';
 
 COMMENT ON FUNCTION create_memory IS 'Creates a base memory record and corresponding graph node. Embedding must be pre-computed by application.';
-
-COMMENT ON FUNCTION create_memory_relationship IS 'Creates a typed edge between two memories in the graph. Used for causal chains, contradictions, etc.';
 
 COMMENT ON FUNCTION link_memory_to_concept IS 'Links a memory to an abstract concept, creating the concept if needed. Updates both relational and graph layers.';
 
@@ -3052,6 +3074,7 @@ RETURNS JSONB AS $$
 DECLARE
     last_user TIMESTAMPTZ;
     pending_count INT;
+    user_local TIMESTAMPTZ;
 BEGIN
     SELECT last_user_contact INTO last_user FROM heartbeat_state WHERE id = 1;
 
@@ -3060,15 +3083,21 @@ BEGIN
     FROM external_calls
     WHERE status = 'pending';
 
+    -- Michael is in Pacific time (UTC-8)
+    user_local := CURRENT_TIMESTAMP AT TIME ZONE 'America/Los_Angeles';
+
     RETURN jsonb_build_object(
         'timestamp', CURRENT_TIMESTAMP,
+        'user_timezone', 'America/Los_Angeles',
+        'user_local_time', to_char(user_local, 'HH24:MI'),
+        'user_local_day', to_char(user_local, 'Day'),
         'time_since_user_hours', CASE
             WHEN last_user IS NULL THEN NULL
             ELSE EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_user)) / 3600
         END,
         'pending_events', pending_count,
-        'day_of_week', EXTRACT(DOW FROM CURRENT_TIMESTAMP),
-        'hour_of_day', EXTRACT(HOUR FROM CURRENT_TIMESTAMP)
+        'day_of_week', EXTRACT(DOW FROM user_local),
+        'hour_of_day', EXTRACT(HOUR FROM user_local)
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -3340,248 +3369,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Execute a single action and return result
-CREATE OR REPLACE FUNCTION execute_heartbeat_action(
-    p_heartbeat_id UUID,
-    p_action TEXT,
-    p_params JSONB DEFAULT '{}'
-)
-RETURNS JSONB AS $$
-DECLARE
-    action_kind heartbeat_action;
-    action_cost FLOAT;
-    current_e FLOAT;
-    result JSONB;
-    queued_call_id UUID;
-    outbox_id UUID;
-    remembered_id UUID;
-    boundary_hits JSONB;
-    boundary_content TEXT;
-BEGIN
-    -- Validate action name early (avoid charging energy for unknown actions)
-    BEGIN
-        action_kind := p_action::heartbeat_action;
-    EXCEPTION
-        WHEN invalid_text_representation THEN
-            RETURN jsonb_build_object(
-                'success', false,
-                'error', 'Unknown action: ' || COALESCE(p_action, '<null>')
-            );
-    END;
 
-    -- Get action cost + current energy
-    action_cost := get_action_cost(p_action);
-    current_e := get_current_energy();
-
-    -- Check energy
-    IF current_e < action_cost THEN
-        RETURN jsonb_build_object(
-            'success', false,
-            'error', 'Insufficient energy',
-            'required', action_cost,
-            'available', current_e
-        );
-    END IF;
-
-    -- Deduct energy
-    -- Boundary pre-checks for side-effects (no energy charge on refusal).
-    IF p_action IN ('reach_out_public', 'synthesize') THEN
-        boundary_content := COALESCE(p_params->>'content', '');
-        SELECT COALESCE(jsonb_agg(row_to_json(r)), '[]'::jsonb)
-        INTO boundary_hits
-        FROM check_boundaries(boundary_content) r;
-
-        IF boundary_hits IS NOT NULL AND jsonb_array_length(boundary_hits) > 0 THEN
-            IF EXISTS (
-                SELECT 1
-                FROM jsonb_array_elements(boundary_hits) e
-                WHERE e->>'response_type' = 'refuse'
-            ) THEN
-                RETURN jsonb_build_object(
-                    'success', false,
-                    'error', 'Boundary triggered',
-                    'boundaries', boundary_hits
-                );
-            END IF;
-        END IF;
-    END IF;
-
-    PERFORM update_energy(-action_cost);
-
-    -- Execute based on action type
-    CASE p_action
-        WHEN 'observe' THEN
-            result := jsonb_build_object('environment', get_environment_snapshot());
-
-        WHEN 'review_goals' THEN
-            result := jsonb_build_object('goals', get_goals_snapshot());
-
-        WHEN 'remember' THEN
-            remembered_id := create_episodic_memory(
-                p_content := COALESCE(p_params->>'content', ''),
-                p_context := COALESCE(p_params, '{}'::jsonb) || jsonb_build_object('heartbeat_id', p_heartbeat_id),
-                p_emotional_valence := COALESCE((p_params->>'emotional_valence')::float, 0),
-                p_importance := COALESCE((p_params->>'importance')::float, 0.4)
-            );
-            result := jsonb_build_object('memory_id', remembered_id);
-
-        WHEN 'recall' THEN
-            -- Query memory system
-            SELECT jsonb_agg(row_to_json(r)) INTO result
-            FROM fast_recall(p_params->>'query', COALESCE((p_params->>'limit')::int, 5)) r;
-            result := jsonb_build_object('memories', COALESCE(result, '[]'::jsonb));
-            PERFORM satisfy_drive('curiosity', 0.2);
-
-        WHEN 'connect' THEN
-            -- Create graph relationship
-            PERFORM create_memory_relationship(
-                (p_params->>'from_id')::UUID,
-                (p_params->>'to_id')::UUID,
-                (p_params->>'relationship_type')::graph_edge_type,
-                COALESCE(p_params->'properties', '{}'::jsonb)
-            );
-            result := jsonb_build_object('connected', true);
-            PERFORM satisfy_drive('coherence', 0.1);
-
-        WHEN 'reprioritize' THEN
-            -- Change goal priority
-            PERFORM change_goal_priority(
-                (p_params->>'goal_id')::UUID,
-                (p_params->>'new_priority')::goal_priority,
-                p_params->>'reason'
-            );
-            IF (p_params->>'new_priority') = 'completed' THEN
-                PERFORM satisfy_drive('competence', 0.4);
-            END IF;
-            result := jsonb_build_object('reprioritized', true);
-
-        WHEN 'reflect' THEN
-            -- Create a reflection memory
-            DECLARE
-                reflection_id UUID;
-            BEGIN
-                reflection_id := create_semantic_memory(
-                    p_params->>'insight',
-                    COALESCE((p_params->>'confidence')::float, 0.7),
-                    ARRAY['reflection', 'self-model'],
-                    NULL,
-                    jsonb_build_object('heartbeat_id', p_heartbeat_id),
-                    0.6
-                );
-                result := jsonb_build_object('reflection_memory_id', reflection_id);
-            END;
-            PERFORM satisfy_drive('coherence', 0.2);
-
-        WHEN 'maintain' THEN
-            -- Update a belief or memory
-            IF p_params ? 'worldview_id' THEN
-                UPDATE worldview_primitives
-                SET confidence = COALESCE((p_params->>'new_confidence')::float, confidence),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = (p_params->>'worldview_id')::UUID;
-            END IF;
-            result := jsonb_build_object('maintained', true);
-            PERFORM satisfy_drive('coherence', 0.1);
-
-        WHEN 'brainstorm_goals' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
-                'think',
-                jsonb_build_object(
-                    'kind', 'brainstorm_goals',
-                    'heartbeat_id', p_heartbeat_id,
-                    'context', gather_turn_context(),
-                    'params', COALESCE(p_params, '{}'::jsonb)
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
-
-        WHEN 'inquire_shallow', 'inquire_deep' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
-                'think',
-                jsonb_build_object(
-                    'kind', 'inquire',
-                    'depth', p_action,
-                    'heartbeat_id', p_heartbeat_id,
-                    'query', COALESCE(p_params->>'query', p_params->>'question'),
-                    'context', gather_turn_context(),
-                    'params', COALESCE(p_params, '{}'::jsonb)
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
-            PERFORM satisfy_drive('curiosity', 0.2);
-
-        WHEN 'synthesize' THEN
-            -- Create an artifact memory
-            DECLARE
-                synth_id UUID;
-            BEGIN
-                synth_id := create_semantic_memory(
-                    p_params->>'content',
-                    COALESCE((p_params->>'confidence')::float, 0.8),
-                    ARRAY['synthesis', COALESCE(p_params->>'topic', 'general')],
-                    NULL,
-                    jsonb_build_object('heartbeat_id', p_heartbeat_id, 'sources', p_params->'sources', 'boundaries', boundary_hits),
-                    0.7
-                );
-                result := jsonb_build_object('synthesis_memory_id', synth_id, 'boundaries', boundary_hits);
-            END;
-
-        WHEN 'reach_out_user' THEN
-            INSERT INTO outbox_messages (kind, payload)
-            VALUES (
-                'user',
-                jsonb_build_object(
-                    'message', p_params->>'message',
-                    'intent', p_params->>'intent',
-                    'heartbeat_id', p_heartbeat_id
-                )
-            )
-            RETURNING id INTO outbox_id;
-            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id);
-            PERFORM satisfy_drive('connection', 0.3);
-
-        WHEN 'reach_out_public' THEN
-            INSERT INTO outbox_messages (kind, payload)
-            VALUES (
-                'public',
-                jsonb_build_object(
-                    'platform', p_params->>'platform',
-                    'content', p_params->>'content',
-                    'heartbeat_id', p_heartbeat_id,
-                    'boundaries', boundary_hits
-                )
-            )
-            RETURNING id INTO outbox_id;
-            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id, 'boundaries', boundary_hits);
-            PERFORM satisfy_drive('connection', 0.3);
-
-        WHEN 'rest' THEN
-            -- Do nothing, energy already preserved
-            result := jsonb_build_object('rested', true, 'energy_preserved', current_e - action_cost);
-            PERFORM satisfy_drive('rest', 0.4);
-
-        ELSE
-            -- Should be unreachable due to enum validation above, but keep safe.
-            RETURN jsonb_build_object(
-                'success', false,
-                'error', 'Unknown action: ' || COALESCE(p_action, '<null>')
-            );
-    END CASE;
-
-    RETURN jsonb_build_object(
-        'success', true,
-        'action', p_action,
-        'cost', action_cost,
-        'energy_remaining', get_current_energy(),
-        'result', result
-    );
-END;
-$$ LANGUAGE plpgsql;
 
 -- Complete a heartbeat (Phase 6: Record)
 CREATE OR REPLACE FUNCTION complete_heartbeat(
@@ -3781,7 +3569,6 @@ COMMENT ON TABLE external_calls IS 'Queue for LLM and embedding API calls. Worke
 
 COMMENT ON FUNCTION should_run_heartbeat IS 'Check if heartbeat interval has elapsed and system is not paused.';
 COMMENT ON FUNCTION start_heartbeat IS 'Initialize heartbeat: regenerate energy, gather context, queue think request.';
-COMMENT ON FUNCTION execute_heartbeat_action IS 'Execute a single action, deducting energy and returning results.';
 COMMENT ON FUNCTION complete_heartbeat IS 'Finalize heartbeat: create episodic memory, update log, set next heartbeat time.';
 COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision: environment, goals, memories, identity, worldview, energy.';
 
@@ -4371,7 +4158,7 @@ ORDER BY hour DESC;
 CREATE OR REPLACE FUNCTION recompute_neighborhood(
     p_memory_id UUID,
     p_neighbor_count INT DEFAULT 20,
-    p_min_similarity FLOAT DEFAULT 0.5
+    p_min_similarity FLOAT DEFAULT 0.35  -- Lowered from 0.5; revisit when memory count > 200
 )
 RETURNS VOID AS $$
 DECLARE
@@ -4548,13 +4335,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION find_contradictions(p_memory_id UUID DEFAULT NULL)
-RETURNS TABLE (
-    memory_a UUID,
-    memory_b UUID,
-    content_a TEXT,
-    content_b TEXT
-) AS $$
+CREATE OR REPLACE FUNCTION public.find_contradictions(p_memory_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(memory_a uuid, memory_b uuid, content_a text, content_b text)
+ LANGUAGE plpgsql
+AS $function$
 DECLARE
     filter_clause TEXT;
     sql TEXT;
@@ -4592,7 +4376,7 @@ BEGIN
             RETURN;
     END;
 END;
-$$ LANGUAGE plpgsql;
+$function$;
 
 CREATE OR REPLACE FUNCTION find_causal_chain(p_memory_id UUID, p_depth INT DEFAULT 3)
 RETURNS TABLE (
@@ -4815,7 +4599,27 @@ BEGIN
             BEGIN
                 from_id := NULLIF(rel->>'from_id', '')::uuid;
                 to_id := NULLIF(rel->>'to_id', '')::uuid;
-                rel_type := (rel->>'type')::graph_edge_type;
+                
+                -- Map LLM relationship types to valid enum values
+                rel_type := CASE LOWER(rel->>'type')
+                    WHEN 'resolves' THEN 'DERIVED_FROM'
+                    WHEN 'diagnosis_of' THEN 'DERIVED_FROM'
+                    WHEN 'fulfilled_by' THEN 'SUPPORTS'
+                    WHEN 'led_to' THEN 'CAUSES'
+                    WHEN 'contextualizes' THEN 'ASSOCIATED'
+                    WHEN 'leads_to' THEN 'CAUSES'
+                    WHEN 'temporal_sequence' THEN 'TEMPORAL_NEXT'
+                    WHEN 'related_to' THEN 'ASSOCIATED'
+                    WHEN 'supports' THEN 'SUPPORTS'
+                    WHEN 'contradicts' THEN 'CONTRADICTS'
+                    WHEN 'causes' THEN 'CAUSES'
+                    WHEN 'derived_from' THEN 'DERIVED_FROM'
+                    WHEN 'instance_of' THEN 'INSTANCE_OF'
+                    WHEN 'parent_of' THEN 'PARENT_OF'
+                    WHEN 'associated' THEN 'ASSOCIATED'
+                    ELSE 'ASSOCIATED'  -- fallback for unknown types
+                END::graph_edge_type;
+                
                 rel_conf := COALESCE((rel->>'confidence')::float, 0.8);
                 IF from_id IS NOT NULL AND to_id IS NOT NULL THEN
                     PERFORM discover_relationship(from_id, to_id, rel_type, rel_conf, 'reflection', p_heartbeat_id, 'reflect');
@@ -4871,235 +4675,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION execute_heartbeat_action(
-    p_heartbeat_id UUID,
-    p_action TEXT,
-    p_params JSONB DEFAULT '{}'
-)
-RETURNS JSONB AS $$
-DECLARE
-    action_kind heartbeat_action;
-    action_cost FLOAT;
-    current_e FLOAT;
-    result JSONB;
-    queued_call_id UUID;
-    outbox_id UUID;
-    remembered_id UUID;
-    boundary_hits JSONB;
-    boundary_content TEXT;
-BEGIN
-    BEGIN
-        action_kind := p_action::heartbeat_action;
-    EXCEPTION
-        WHEN invalid_text_representation THEN
-            RETURN jsonb_build_object('success', false, 'error', 'Unknown action: ' || COALESCE(p_action, '<null>'));
-    END;
 
-    action_cost := get_action_cost(p_action);
-    current_e := get_current_energy();
-
-    IF current_e < action_cost THEN
-        RETURN jsonb_build_object(
-            'success', false,
-            'error', 'Insufficient energy',
-            'required', action_cost,
-            'available', current_e
-        );
-    END IF;
-
-    -- Boundary pre-checks for side-effects (no energy charge on refusal).
-    IF p_action IN ('reach_out_public', 'synthesize') THEN
-        boundary_content := COALESCE(p_params->>'content', '');
-        SELECT COALESCE(jsonb_agg(row_to_json(r)), '[]'::jsonb)
-        INTO boundary_hits
-        FROM check_boundaries(boundary_content) r;
-
-        IF boundary_hits IS NOT NULL AND jsonb_array_length(boundary_hits) > 0 THEN
-            IF EXISTS (
-                SELECT 1
-                FROM jsonb_array_elements(boundary_hits) e
-                WHERE e->>'response_type' = 'refuse'
-            ) THEN
-                RETURN jsonb_build_object(
-                    'success', false,
-                    'error', 'Boundary triggered',
-                    'boundaries', boundary_hits
-                );
-            END IF;
-        END IF;
-    END IF;
-
-    PERFORM update_energy(-action_cost);
-
-    CASE p_action
-        WHEN 'observe' THEN
-            result := jsonb_build_object('environment', get_environment_snapshot());
-
-        WHEN 'review_goals' THEN
-            result := jsonb_build_object('goals', get_goals_snapshot());
-
-        WHEN 'remember' THEN
-            remembered_id := create_episodic_memory(
-                p_content := COALESCE(p_params->>'content', ''),
-                p_context := COALESCE(p_params, '{}'::jsonb) || jsonb_build_object('heartbeat_id', p_heartbeat_id),
-                p_emotional_valence := COALESCE((p_params->>'emotional_valence')::float, 0),
-                p_importance := COALESCE((p_params->>'importance')::float, 0.4)
-            );
-            result := jsonb_build_object('memory_id', remembered_id);
-
-        WHEN 'recall' THEN
-            SELECT jsonb_agg(row_to_json(r)) INTO result
-            FROM fast_recall(p_params->>'query', COALESCE((p_params->>'limit')::int, 5)) r;
-            result := jsonb_build_object('memories', COALESCE(result, '[]'::jsonb));
-            PERFORM satisfy_drive('curiosity', 0.2);
-
-        WHEN 'connect' THEN
-            PERFORM create_memory_relationship(
-                (p_params->>'from_id')::UUID,
-                (p_params->>'to_id')::UUID,
-                (p_params->>'relationship_type')::graph_edge_type,
-                COALESCE(p_params->'properties', '{}'::jsonb)
-            );
-            result := jsonb_build_object('connected', true);
-            PERFORM satisfy_drive('coherence', 0.1);
-
-        WHEN 'reprioritize' THEN
-            PERFORM change_goal_priority(
-                (p_params->>'goal_id')::UUID,
-                (p_params->>'new_priority')::goal_priority,
-                p_params->>'reason'
-            );
-            IF (p_params->>'new_priority') = 'completed' THEN
-                PERFORM satisfy_drive('competence', 0.4);
-            END IF;
-            result := jsonb_build_object('reprioritized', true);
-
-        WHEN 'reflect' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
-                'think',
-                jsonb_build_object(
-                    'kind', 'reflect',
-                    'recent_memories', get_recent_context(20),
-                    'identity', get_identity_context(),
-                    'worldview', get_worldview_context(),
-                    'contradictions', (
-                        SELECT COALESCE(jsonb_agg(row_to_json(t)), '[]'::jsonb)
-                        FROM (SELECT * FROM find_contradictions(NULL) LIMIT 5) t
-                    ),
-                    'goals', get_goals_snapshot(),
-                    'heartbeat_id', p_heartbeat_id,
-                    'instructions', 'Analyze patterns. Note contradictions. Suggest identity updates. Discover relationships between memories.'
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
-            PERFORM satisfy_drive('coherence', 0.2);
-
-        WHEN 'maintain' THEN
-            IF p_params ? 'worldview_id' THEN
-                UPDATE worldview_primitives
-                SET confidence = COALESCE((p_params->>'new_confidence')::float, confidence),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = (p_params->>'worldview_id')::UUID;
-            END IF;
-            result := jsonb_build_object('maintained', true);
-            PERFORM satisfy_drive('coherence', 0.1);
-
-        WHEN 'brainstorm_goals' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
-                'think',
-                jsonb_build_object(
-                    'kind', 'brainstorm_goals',
-                    'heartbeat_id', p_heartbeat_id,
-                    'context', gather_turn_context(),
-                    'params', COALESCE(p_params, '{}'::jsonb)
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
-
-        WHEN 'inquire_shallow', 'inquire_deep' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
-                'think',
-                jsonb_build_object(
-                    'kind', 'inquire',
-                    'depth', p_action,
-                    'heartbeat_id', p_heartbeat_id,
-                    'query', COALESCE(p_params->>'query', p_params->>'question'),
-                    'context', gather_turn_context(),
-                    'params', COALESCE(p_params, '{}'::jsonb)
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
-            PERFORM satisfy_drive('curiosity', 0.2);
-
-        WHEN 'synthesize' THEN
-            DECLARE synth_id UUID;
-            BEGIN
-                synth_id := create_semantic_memory(
-                    p_params->>'content',
-                    COALESCE((p_params->>'confidence')::float, 0.8),
-                    ARRAY['synthesis', COALESCE(p_params->>'topic', 'general')],
-                    NULL,
-                    jsonb_build_object('heartbeat_id', p_heartbeat_id, 'sources', p_params->'sources', 'boundaries', boundary_hits),
-                    0.7
-                );
-                result := jsonb_build_object('synthesis_memory_id', synth_id, 'boundaries', boundary_hits);
-            END;
-
-        WHEN 'reach_out_user' THEN
-            INSERT INTO outbox_messages (kind, payload)
-            VALUES (
-                'user',
-                jsonb_build_object(
-                    'message', p_params->>'message',
-                    'intent', p_params->>'intent',
-                    'heartbeat_id', p_heartbeat_id
-                )
-            )
-            RETURNING id INTO outbox_id;
-            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id);
-            PERFORM satisfy_drive('connection', 0.3);
-
-        WHEN 'reach_out_public' THEN
-            INSERT INTO outbox_messages (kind, payload)
-            VALUES (
-                'public',
-                jsonb_build_object(
-                    'platform', p_params->>'platform',
-                    'content', p_params->>'content',
-                    'heartbeat_id', p_heartbeat_id,
-                    'boundaries', boundary_hits
-                )
-            )
-            RETURNING id INTO outbox_id;
-            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id, 'boundaries', boundary_hits);
-            PERFORM satisfy_drive('connection', 0.3);
-
-        WHEN 'rest' THEN
-            result := jsonb_build_object('rested', true, 'energy_preserved', current_e - action_cost);
-            PERFORM satisfy_drive('rest', 0.4);
-
-        ELSE
-            RETURN jsonb_build_object('success', false, 'error', 'Unknown action: ' || COALESCE(p_action, '<null>'));
-    END CASE;
-
-    RETURN jsonb_build_object(
-        'success', true,
-        'action', p_action,
-        'cost', action_cost,
-        'energy_remaining', get_current_energy(),
-        'result', result
-    );
-END;
-$$ LANGUAGE plpgsql;
 
 -- ============================================================================
 -- TIP OF TONGUE / PARTIAL ACTIVATION
@@ -5226,3 +4802,430 @@ reflect:
   "contradictions_noted": [...],
   "self_updates": [{"kind": "values", "concept": "honesty", "strength": 0.8, "evidence_memory_id": null}]
 }';
+
+-- =====================================================================
+-- Canonical schema.sql (regenerated 2025-12-25 00:03:53Z)
+-- Includes hardened execute_heartbeat_action and create_memory_relationship (2025-12-24)
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.create_memory_relationship(p_from_id uuid, p_to_id uuid, p_relationship_type graph_edge_type, p_properties jsonb DEFAULT '{}'::jsonb)
+ RETURNS void
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  props_text text := '';
+  qry text;
+  rel_token text;
+BEGIN
+  -- Guardrails: required params must be present
+  IF p_from_id IS NULL OR p_to_id IS NULL THEN
+    RAISE EXCEPTION 'create_memory_relationship: from_id/to_id must not be NULL (from_id=%, to_id=%)', p_from_id, p_to_id;
+  END IF;
+
+  -- relationship_type is an enum, but still guard against weird empty/NULL routing
+  IF p_relationship_type IS NULL THEN
+    RAISE EXCEPTION 'create_memory_relationship: relationship_type must not be NULL';
+  END IF;
+
+  -- Belt-and-suspenders: ensure relationship token is a valid Cypher identifier
+  rel_token := p_relationship_type::text;
+  IF rel_token IS NULL OR rel_token = '' OR rel_token !~ '^[A-Za-z_][A-Za-z0-9_]*$' THEN
+    RAISE EXCEPTION 'create_memory_relationship: invalid relationship_type token: %', rel_token;
+  END IF;
+
+  IF p_properties IS NULL OR p_properties = '{}'::jsonb THEN
+    props_text := '{}';
+  ELSE
+    SELECT string_agg(
+      CASE
+        WHEN jsonb_typeof(value) IN ('number','boolean','null') THEN
+          format('%I: %s', key, value::text)
+        WHEN jsonb_typeof(value) = 'string' THEN
+          format('%I: %L', key, trim(both '"' from value::text))
+        ELSE
+          format('%I: %L', key, value::text)
+      END,
+      ', '
+    )
+    INTO props_text
+    FROM jsonb_each(p_properties);
+
+    props_text := format('{%s}', props_text);
+  END IF;
+
+  qry := format(
+    'SELECT * FROM cypher(''memory_graph'', $q$
+      MATCH (a:MemoryNode {memory_id: %L}), (b:MemoryNode {memory_id: %L})
+      MERGE (a)-[r:%s]->(b)
+      SET r += %s
+      RETURN r
+    $q$) as (result agtype)',
+    p_from_id,
+    p_to_id,
+    rel_token,
+    props_text
+  );
+
+  EXECUTE qry;
+
+EXCEPTION WHEN OTHERS THEN
+  RAISE EXCEPTION 'create_memory_relationship failed: % | generated query: %', SQLERRM, qry;
+END;
+$function$;
+COMMENT ON FUNCTION create_memory_relationship IS 'Creates a typed edge between two memories in the graph. Used for causal chains, contradictions, etc.';
+
+CREATE OR REPLACE FUNCTION public.execute_heartbeat_action(p_heartbeat_id uuid, p_action text, p_params jsonb DEFAULT '{}'::jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    action_kind heartbeat_action;
+    action_cost FLOAT;
+    current_e FLOAT;
+    result JSONB;
+    queued_call_id UUID;
+    outbox_id UUID;
+    remembered_id UUID;
+    boundary_hits JSONB;
+    boundary_content TEXT;
+BEGIN
+    BEGIN
+        action_kind := p_action::heartbeat_action;
+    EXCEPTION
+        WHEN invalid_text_representation THEN
+            RETURN jsonb_build_object('success', false, 'error', 'Unknown action: ' || COALESCE(p_action, '<null>'));
+    END;
+
+    action_cost := get_action_cost(p_action);
+    current_e := get_current_energy();
+
+    IF current_e < action_cost THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', 'Insufficient energy',
+            'required', action_cost,
+            'available', current_e
+        );
+    END IF;
+
+    IF p_action IN ('reach_out_public', 'synthesize') THEN
+        boundary_content := COALESCE(p_params->>'content', '');
+        SELECT COALESCE(jsonb_agg(row_to_json(r)), '[]'::jsonb)
+        INTO boundary_hits
+        FROM check_boundaries(boundary_content) r;
+
+        IF boundary_hits IS NOT NULL AND jsonb_array_length(boundary_hits) > 0 THEN
+            IF EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(boundary_hits) e
+                WHERE e->>'response_type' = 'refuse'
+            ) THEN
+                RETURN jsonb_build_object(
+                    'success', false,
+                    'error', 'Boundary triggered',
+                    'boundaries', boundary_hits
+                );
+            END IF;
+        END IF;
+    END IF;
+
+    PERFORM update_energy(-action_cost);
+
+    CASE p_action
+        WHEN 'observe' THEN
+            result := jsonb_build_object('environment', get_environment_snapshot());
+
+        WHEN 'review_goals' THEN
+            result := jsonb_build_object('goals', get_goals_snapshot());
+
+        WHEN 'remember' THEN
+            remembered_id := create_episodic_memory(
+                p_content := COALESCE(p_params->>'content', ''),
+                p_context := COALESCE(p_params, '{}'::jsonb) || jsonb_build_object('heartbeat_id', p_heartbeat_id),
+                p_emotional_valence := COALESCE((p_params->>'emotional_valence')::float, 0),
+                p_importance := COALESCE((p_params->>'importance')::float, 0.4)
+            );
+            result := jsonb_build_object('memory_id', remembered_id);
+
+        WHEN 'recall' THEN
+            SELECT jsonb_agg(row_to_json(r)) INTO result
+            FROM fast_recall(p_params->>'query', COALESCE((p_params->>'limit')::int, 5)) r;
+            result := jsonb_build_object('memories', COALESCE(result, '[]'::jsonb));
+            PERFORM satisfy_drive('curiosity', 0.2);
+
+        WHEN 'connect' THEN
+            DECLARE
+                v_from uuid;
+                v_to uuid;
+                v_from_raw text;
+                v_to_raw text;
+                v_rel_text text;
+                v_rel graph_edge_type;
+            BEGIN
+                v_from_raw := p_params->>'from_id';
+                v_to_raw := p_params->>'to_id';
+                
+                -- Try to resolve references (UUID or semantic label)
+                v_from := resolve_memory_reference(v_from_raw);
+                v_to := resolve_memory_reference(v_to_raw);
+                v_rel_text := NULLIF(btrim(COALESCE(p_params->>'relationship_type','')), '');
+
+                -- Reject + salvage: could not resolve IDs or missing relationship_type
+                IF v_from IS NULL OR v_to IS NULL OR v_rel_text IS NULL THEN
+                    remembered_id := create_episodic_memory(
+                        p_content := 'Rejected connect proposal (unresolved references). Raw: ' || COALESCE(p_params::text, '{}'),
+                        p_context := jsonb_build_object(
+                            'kind','ingestion_reject',
+                            'action','connect',
+                            'reason','Unresolved memory references',
+                            'from_raw', COALESCE(v_from_raw, '<missing>'),
+                            'to_raw', COALESCE(v_to_raw, '<missing>'),
+                            'from_resolved', v_from IS NOT NULL,
+                            'to_resolved', v_to IS NOT NULL,
+                            'heartbeat_id', p_heartbeat_id
+                        ),
+                        p_emotional_valence := 0,
+                        p_importance := 0.2
+                    );
+
+                    RETURN jsonb_build_object(
+                        'success', false,
+                        'error', 'Unresolved memory references',
+                        'salvaged_memory_id', remembered_id,
+                        'details', jsonb_build_object(
+                            'from_raw', COALESCE(v_from_raw,'<missing>'),
+                            'to_raw', COALESCE(v_to_raw,'<missing>'),
+                            'from_resolved', v_from,
+                            'to_resolved', v_to,
+                            'relationship_type', COALESCE(v_rel_text,'<missing>')
+                        )
+                    );
+                END IF;
+
+                -- Reject + salvage: relationship_type must be a valid enum
+                BEGIN
+                    v_rel := v_rel_text::graph_edge_type;
+                EXCEPTION WHEN invalid_text_representation THEN
+                    remembered_id := create_episodic_memory(
+                        p_content := 'Rejected connect proposal (invalid relationship_type enum). relationship_type=' ||
+                                     COALESCE(v_rel_text,'<null>') || '. Raw: ' || COALESCE(p_params::text, '{}'),
+                        p_context := jsonb_build_object(
+                            'kind','ingestion_reject',
+                            'action','connect',
+                            'reason','Invalid relationship_type enum',
+                            'relationship_type', v_rel_text,
+                            'heartbeat_id', p_heartbeat_id
+                        ),
+                        p_emotional_valence := 0,
+                        p_importance := 0.2
+                    );
+
+                    RETURN jsonb_build_object(
+                        'success', false,
+                        'error', 'Invalid relationship_type enum',
+                        'relationship_type', v_rel_text,
+                        'salvaged_memory_id', remembered_id
+                    );
+                END;
+
+                PERFORM create_memory_relationship(
+                    v_from,
+                    v_to,
+                    v_rel,
+                    COALESCE(p_params->'properties', '{}'::jsonb)
+                );
+                result := jsonb_build_object(
+                    'connected', true,
+                    'from_id', v_from,
+                    'to_id', v_to,
+                    'resolved_from', v_from_raw,
+                    'resolved_to', v_to_raw
+                );
+                PERFORM satisfy_drive('coherence', 0.1);
+            END;
+
+        WHEN 'reprioritize' THEN
+            DECLARE
+                v_goal_id UUID;
+                v_goal_raw TEXT;
+            BEGIN
+                -- Accept both 'goal_id' and 'goal' keys (LLM sometimes uses either)
+                v_goal_raw := COALESCE(p_params->>'goal_id', p_params->>'goal');
+                v_goal_id := resolve_goal_reference(v_goal_raw);
+                
+                IF v_goal_id IS NULL THEN
+                    -- Salvage the intent
+                    remembered_id := create_episodic_memory(
+                        p_content := 'Rejected reprioritize (unresolved goal). Raw: ' || COALESCE(p_params::text, '{}'),
+                        p_context := jsonb_build_object(
+                            'kind', 'ingestion_reject',
+                            'action', 'reprioritize',
+                            'reason', 'Unresolved goal reference',
+                            'goal_raw', COALESCE(v_goal_raw, '<missing>'),
+                            'heartbeat_id', p_heartbeat_id
+                        ),
+                        p_emotional_valence := 0,
+                        p_importance := 0.2
+                    );
+                    RETURN jsonb_build_object(
+                        'success', false,
+                        'error', 'Unresolved goal reference',
+                        'salvaged_memory_id', remembered_id,
+                        'goal_raw', v_goal_raw
+                    );
+                END IF;
+                
+                PERFORM change_goal_priority(
+                    v_goal_id,
+                    (p_params->>'new_priority')::goal_priority,
+                    p_params->>'reason'
+                );
+                IF (p_params->>'new_priority') = 'completed' THEN
+                    PERFORM satisfy_drive('competence', 0.4);
+                END IF;
+                result := jsonb_build_object(
+                    'reprioritized', true,
+                    'goal_id', v_goal_id,
+                    'resolved_from', v_goal_raw
+                );
+            END;
+
+        WHEN 'reflect' THEN
+            INSERT INTO external_calls (call_type, input, heartbeat_id)
+            VALUES (
+                'think',
+                jsonb_build_object(
+                    'kind', 'reflect',
+                    'recent_memories', get_recent_context(20),
+                    'identity', get_identity_context(),
+                    'worldview', get_worldview_context(),
+                    'contradictions', (
+                        SELECT COALESCE(jsonb_agg(row_to_json(t)), '[]'::jsonb)
+                        FROM (SELECT * FROM find_contradictions(NULL) LIMIT 5) t
+                    ),
+                    'goals', get_goals_snapshot(),
+                    'heartbeat_id', p_heartbeat_id,
+                    'instructions', 'Analyze patterns. Note contradictions. Suggest identity updates. Discover relationships between memories.'
+                ),
+                p_heartbeat_id
+            )
+            RETURNING id INTO queued_call_id;
+            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
+            PERFORM satisfy_drive('coherence', 0.2);
+
+        WHEN 'maintain' THEN
+            IF p_params ? 'worldview_id' THEN
+                -- Harden: worldview_id can be semantic text; only act if it's a real UUID
+                DECLARE wid uuid;
+                BEGIN
+                    wid := public.try_uuid(p_params->>'worldview_id');
+
+                    IF wid IS NOT NULL THEN
+                        UPDATE worldview_primitives
+                        SET confidence = COALESCE((p_params->>'new_confidence')::float, confidence),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = wid;
+                    END IF;
+                END;
+            END IF;
+            result := jsonb_build_object('maintained', true);
+            PERFORM satisfy_drive('coherence', 0.1);
+
+        WHEN 'brainstorm_goals' THEN
+            INSERT INTO external_calls (call_type, input, heartbeat_id)
+            VALUES (
+                'think',
+                jsonb_build_object(
+                    'kind', 'brainstorm_goals',
+                    'heartbeat_id', p_heartbeat_id,
+                    'context', gather_turn_context(),
+                    'params', COALESCE(p_params, '{}'::jsonb)
+                ),
+                p_heartbeat_id
+            )
+            RETURNING id INTO queued_call_id;
+            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
+
+        WHEN 'inquire_shallow', 'inquire_deep' THEN
+            INSERT INTO external_calls (call_type, input, heartbeat_id)
+            VALUES (
+                'think',
+                jsonb_build_object(
+                    'kind', 'inquire',
+                    'depth', p_action,
+                    'heartbeat_id', p_heartbeat_id,
+                    'query', COALESCE(p_params->>'query', p_params->>'question'),
+                    'context', gather_turn_context(),
+                    'params', COALESCE(p_params, '{}'::jsonb)
+                ),
+                p_heartbeat_id
+            )
+            RETURNING id INTO queued_call_id;
+            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
+            PERFORM satisfy_drive('curiosity', 0.2);
+
+        WHEN 'synthesize' THEN
+            DECLARE synth_id UUID;
+            DECLARE tags text[];
+            BEGIN
+                tags := ARRAY['synthesis', COALESCE(p_params->>'topic', 'general')]::text[];
+                synth_id := create_semantic_memory(
+                    p_params->>'content',
+                    COALESCE((p_params->>'confidence')::float, 0.8),
+                    tags,
+                    NULL,
+                    jsonb_build_object('heartbeat_id', p_heartbeat_id, 'sources', p_params->'sources', 'boundaries', boundary_hits),
+                    0.7
+                );
+                result := jsonb_build_object('synthesis_memory_id', synth_id, 'boundaries', boundary_hits);
+            END;
+
+        WHEN 'reach_out_user' THEN
+            INSERT INTO outbox_messages (kind, payload)
+            VALUES (
+                'user',
+                jsonb_build_object(
+                    'message', p_params->>'message',
+                    'intent', p_params->>'intent',
+                    'heartbeat_id', p_heartbeat_id
+                )
+            )
+            RETURNING id INTO outbox_id;
+            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id);
+            PERFORM satisfy_drive('connection', 0.3);
+
+        WHEN 'reach_out_public' THEN
+            INSERT INTO outbox_messages (kind, payload)
+            VALUES (
+                'public',
+                jsonb_build_object(
+                    'platform', p_params->>'platform',
+                    'content', p_params->>'content',
+                    'heartbeat_id', p_heartbeat_id,
+                    'boundaries', boundary_hits
+                )
+            )
+            RETURNING id INTO outbox_id;
+            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id, 'boundaries', boundary_hits);
+            PERFORM satisfy_drive('connection', 0.3);
+
+        WHEN 'rest' THEN
+            result := jsonb_build_object('rested', true, 'energy_preserved', current_e - action_cost);
+            PERFORM satisfy_drive('rest', 0.4);
+
+        ELSE
+            RETURN jsonb_build_object('success', false, 'error', 'Unknown action: ' || COALESCE(p_action, '<null>'));
+    END CASE;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'action', p_action,
+        'cost', action_cost,
+        'energy_remaining', get_current_energy(),
+        'result', result
+    );
+END;
+$function$;
+COMMENT ON FUNCTION execute_heartbeat_action IS 'Execute a single action, deducting energy and returning results.';
+
+SET search_path = ag_catalog, "$user", public;

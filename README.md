@@ -595,3 +595,31 @@ If you need multi-AGI support, consider refactoring the schema to include tenant
 ## Architecture (Design Docs)
 
 See `architecture.md` for a consolidated architecture/design document (includes the heartbeat design proposal and the cognitive architecture essay).
+
+### Database Initialization & Ingestion Safety (Important)
+
+agi-mem treats **all LLM output as untrusted input**.  
+Persistence, graph mutation, and memory updates are protected by explicit ingestion boundaries.
+
+Key points for contributors:
+
+- **`schema.sql` is canonical**  
+  It defines the correct, hardened database state for a *fresh rebuild*.
+
+- **Migrations evolve live systems**  
+  Any changes to functions or schema after initial deployment must be captured as migration files.
+
+- **LLM proposals are validated, not trusted**  
+  Invalid or malformed actions are rejected safely without crashing the system.
+
+- **Meaning is preserved even when actions are rejected**  
+  Rejected proposals (e.g., invalid graph connections) are salvaged as low-importance episodic memories.
+
+Before modifying:
+- `execute_heartbeat_action`
+- `create_memory_relationship`
+- or any ingestion-related logic
+
+👉 Read **“Schema Canonicalization & Ingestion Hardening (Dec 24, 2025)”** in the Debugging / Implementation Notes.
+
+This discipline is essential for system stability, multi-model support, and future extensibility.

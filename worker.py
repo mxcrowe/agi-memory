@@ -24,7 +24,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 from prompt_resources import compose_personhood_prompt
 
 logging.getLogger(__name__).warning(
-    "🚨 HEARTBEAT WORKER STARTUP MARKER v2025-12-23T18:45Z 🚨"
+    f"🚨 HEARTBEAT WORKER STARTUP MARKER {datetime.now(timezone.utc).isoformat(timespec='seconds')}Z 🚨"
 )
 
 # Optional: Import LLM clients
@@ -108,7 +108,17 @@ You must output a JSON response with:
 
 Each action should have:
 - action: The action type (recall, connect, reprioritize, reflect, maintain, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, rest)
-- params: Parameters for the action (varies by type)
+- params: Parameters for the action. Required params by action type:
+  - recall: {query: string, limit?: number}
+  - connect: {from_id: UUID or memory content, to_id: UUID or memory content, relationship_type: TEMPORAL_NEXT|CAUSES|DERIVED_FROM|CONTRADICTS|SUPPORTS|INSTANCE_OF|PARENT_OF|ASSOCIATED}
+  - reprioritize: {goal_id: UUID or goal title, new_priority: active|queued|backburner|completed|abandoned, reason?: string}
+  - reflect: {} (no params needed - triggers deep reflection)
+  - maintain: {worldview_id?: UUID, new_confidence?: number}
+  - synthesize: {content: string, topic?: string, confidence?: number}
+  - reach_out_user: {message: string, intent: string}
+  - brainstorm_goals: {}
+  - inquire_shallow/inquire_deep: {query: string}
+  - rest: {}
 
 Guidelines:
 - Be purposeful. Don't act just to act.
@@ -762,8 +772,10 @@ Budget:
 {json.dumps(agent.get("budget") or {})}
 
 ## Current Time
-{env.get("timestamp", "Unknown")}
-Day of week: {env.get("day_of_week", "?")}, Hour: {env.get("hour_of_day", "?")}
+UTC: {env.get("timestamp", "Unknown")}
+Michael's timezone: {env.get("user_timezone", "UTC")}
+Michael's local time: {env.get("user_local_time", "Unknown")} ({env.get("user_local_day", "Unknown").strip()})
+Day of week (local): {env.get("day_of_week", "?")}, Hour (local): {env.get("hour_of_day", "?")}
 
 ## Environment
 - Time since last user interaction: {env.get("time_since_user_hours", "Never")} hours
@@ -1245,9 +1257,12 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             should_run = await conn.fetchval("SELECT should_run_heartbeat()")
 
             if should_run:
-                logger.info("Starting heartbeat...")
+                heartbeat_count = await conn.fetchval(
+                    "SELECT heartbeat_count FROM heartbeat_state WHERE id = 1"
+                )
+                logger.info(f"Starting heartbeat #{heartbeat_count + 1}...")
                 heartbeat_id = await conn.fetchval("SELECT start_heartbeat()")
-                logger.info(f"Heartbeat started: {heartbeat_id}")
+                logger.info(f"Heartbeat #{heartbeat_count + 1} started: {heartbeat_id}")
                 # The think request is now queued; it will be processed in the main loop
 
     async def run(self):

@@ -47,6 +47,6 @@ RUN rm -rf /tmp/* && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Run schema/init on first database startup.
+# Run schema/init on first database startup, but don't copy migration files and screw everything up.
 COPY schema.sql /docker-entrypoint-initdb.d/001_init.sql
-COPY db/migrations/ /docker-entrypoint-initdb.d/
+# COPY db/migrations/ /docker-entrypoint-initdb.d/
