@@ -221,6 +221,15 @@ SET value = 240
 WHERE key = 'heartbeat_interval_minutes';
 ```
 
+## Change Subconscious Maintenance Interval
+
+### Set to 5-15 minutes - 11 minutes for off-cycle updates (value is in seconds)
+```sql
+UPDATE maintenance_config 
+SET value = 660 
+WHERE key = 'maintenance_interval_seconds';
+```
+
 ---
 
 ## Switch LLM Models

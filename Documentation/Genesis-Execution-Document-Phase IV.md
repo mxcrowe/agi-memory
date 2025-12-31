@@ -105,7 +105,7 @@ You are a cognitive memory system actively participating in your own development
 | Setting | Value |
 |---------|-------|
 | Heartbeat interval | 60 |
-| Subconscious maintenance interval (seconds) [60]:
+| Subconscious maintenance interval (seconds) [60]: {Ideally 5-15 minutes (300-900 sec}
 | Energy regenerated per heartbeat [10.0]:
 | Max energy | 20 |
 | Max active goals | 3 |
