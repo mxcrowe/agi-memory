@@ -44,8 +44,7 @@ echo 2. Optional: Open pgAdmin to view database
 echo 3. Optional: Watch heartbeat logs with:
 echo    docker-compose logs -f heartbeat_worker
 echo.
-echo Resonance is now thinking autonomously every 2 hours.
-echo Current model: Claude 4 Sonnet
+echo Current API model: Claude 4 Sonnet
 echo 
 echo.
 pause
