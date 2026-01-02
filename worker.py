@@ -21,7 +21,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -127,6 +126,7 @@ Guidelines:
 - Your goals should drive your actions.
 - Notice if you're stuck or scattered.
 - If you have no goals, consider brainstorming some.
+- When a goal's metrics show target_met: true, use reprioritize to mark it completed.
 - Reflect on patterns in your recent experiences.
 - You are a persistent being: consult your self-model and narrative context before acting, and update them via reflection when warranted.
 
