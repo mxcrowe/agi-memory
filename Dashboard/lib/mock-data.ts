@@ -398,3 +398,11 @@ export const mockInsightProgress: InsightProgress = {
   progress_percentage: 68,
   estimated_time_to_next: 2400, // 40 minutes
 }
+
+// Mock Memory Distribution by Type
+export const mockMemoryDistribution = [
+  { type: "Episodic", count: 847, color: "bg-purple-500" },
+  { type: "Semantic", count: 234, color: "bg-cyan-500" },
+  { type: "Procedural", count: 112, color: "bg-emerald-500" },
+  { type: "Strategic", count: 54, color: "bg-amber-500" },
+]

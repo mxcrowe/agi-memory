@@ -153,16 +153,7 @@ export default async function DashboardPage() {
             <AgentStatusCard status={agentStatus} />
             <DriveStatus drives={await fetchWithFallback(getDriveStatus, [])} />
 
-            <section className="space-y-4">
-              <h2 className="text-lg font-semibold text-foreground">Memory Dynamics</h2>
-              <div className="grid gap-4 md:grid-cols-2">
-                <SemanticDensityMap clusters={memoryDynamics.semantic_density} />
-                <div className="space-y-4">
-                  <InsightProgressBar progress={insightProgress} />
-                  <MemoryDepthChart data={memoryDistribution} />
-                </div>
-              </div>
-            </section>
+
 
             <EnergyChart />
             <GoalsList goals={goals} />

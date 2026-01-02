@@ -49,6 +49,7 @@ npm run dev
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 If the dashboard loads without errors, you're connected! If you see errors, check:
+
 - Is your PostgreSQL container running? (`docker ps`)
 - Are the credentials correct?
 - Is port 5432 accessible?
@@ -60,6 +61,7 @@ If the dashboard loads without errors, you're connected! If you see errors, chec
 **Problem**: Dashboard can't connect to database
 
 **Solutions**:
+
 1. Verify PostgreSQL is running: `docker ps | grep postgres`
 2. Test connection manually:
    ```bash
@@ -72,6 +74,7 @@ If the dashboard loads without errors, you're connected! If you see errors, chec
 **Problem**: Port 5432 is blocked or PostgreSQL isn't exposed
 
 **Solution**: Update your `docker-compose.yml` to expose the port:
+
 ```yaml
 services:
   db:
@@ -88,7 +91,11 @@ services:
 ## What's Next?
 
 Once connected, the dashboard will display:
+
 - **Agent Status**: Real-time memory counts, clusters, and system health
+- **Drive Status**: All 5 intrinsic drives with urgency indicators
+- **Emotional State**: Current affective state (Valence, Arousal, Dominance)
+- **Subconscious Reflection**: Maintenance cycles and memory tier counts
 - **Memory Explorer**: Browse episodic and semantic memories
 - **Identity Panel**: View identity aspects and worldview beliefs
 - **Knowledge Graph**: Interactive visualization of concept relationships
@@ -97,9 +104,12 @@ Once connected, the dashboard will display:
 ## Architecture
 
 The dashboard uses:
+
 - **Next.js 16** with App Router
-- **@neondatabase/serverless** for PostgreSQL queries
+- **postgres** client for PostgreSQL queries (local Docker compatible)
 - **Recharts** for data visualization
 - **Tailwind CSS** for styling
 
 All database queries are in `lib/db-queries.ts` - customize as needed for your fork!
+
+See `Documents/CHANGELOG.md` for a complete history of modifications.

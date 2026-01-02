@@ -9,6 +9,9 @@ A real-time web dashboard for monitoring and interacting with your Hexis AGI cog
 This dashboard provides a comprehensive interface for your Hexis fork, allowing you to:
 
 - **Monitor Agent Status**: View real-time memory counts, energy levels, and system health
+- **Track Drive States**: Monitor all 5 intrinsic drives (curiosity, coherence, connection, competence, rest)
+- **View Emotional State**: See current affective state using VAD model (Valence, Arousal, Dominance)
+- **Monitor Subconscious**: Track maintenance cycles, memory tiers, and neighborhood refreshes
 - **Explore Memory Systems**: Browse episodic and semantic memories with timeline visualization
 - **Visualize Identity & Worldview**: Examine identity aspects and worldview beliefs
 - **Interact via Chat**: Communicate with your AGI agent (coming soon)
@@ -47,6 +50,7 @@ DATABASE_URL=postgresql://hexis:hexis_password@localhost:5432/hexis
 **Finding Your Connection String:**
 
 Check your Hexis `docker-compose.yml` for the PostgreSQL settings:
+
 - **Username**: Usually `hexis` or `postgres`
 - **Password**: Check `POSTGRES_PASSWORD` environment variable
 - **Host**: `localhost` (if running locally)
@@ -66,6 +70,7 @@ Open [http://localhost:3000](http://localhost:3000) to view your dashboard.
 Visit [http://localhost:3000/api/health](http://localhost:3000/api/health) to check database connectivity.
 
 **Expected Response (Healthy):**
+
 ```json
 {
   "status": "healthy",
@@ -85,15 +90,19 @@ Visit [http://localhost:3000/api/health](http://localhost:3000/api/health) to ch
 ### Agent Status Dashboard (`/`)
 
 Real-time monitoring of your Hexis agent:
+
 - Total memory count by type (episodic, semantic, procedural, strategic)
 - Energy budget tracking
-- Heartbeat cycle visualization (OODA loop phases)
+- Heartbeat cycle visualization with timing and interval
+- Drive status with urgency indicators
+- Emotional state (VAD model)
+- Subconscious maintenance monitoring
 - Active goals and progress
-- System vitality metrics
 
 ### Memory Explorer (`/memory`)
 
 Deep dive into your agent's memory systems:
+
 - **Episodic Timeline**: Chronological view of experiences and events
 - **Semantic Concepts**: Knowledge graph of facts and beliefs
 - **Identity Panel**: Core identity aspects and their stability
@@ -103,6 +112,7 @@ Deep dive into your agent's memory systems:
 ### Chat Interface (`/chat`)
 
 Interact with your Hexis agent:
+
 - Real-time conversation with energy cost tracking
 - Conversation history with relationship context
 - Trust level monitoring
@@ -110,6 +120,7 @@ Interact with your Hexis agent:
 ### Configuration Management (`/config`)
 
 Adjust system parameters:
+
 - Heartbeat intervals and energy budgets
 - Memory consolidation thresholds
 - LLM provider and model selection
@@ -122,7 +133,7 @@ Adjust system parameters:
 
 - **Framework**: Next.js 16 with App Router
 - **Database**: PostgreSQL with pgvector and Apache AGE (from Hexis)
-- **Database Client**: @neondatabase/serverless
+- **Database Client**: postgres (for local Docker compatibility)
 - **Styling**: Tailwind CSS v4
 - **Charts**: Recharts
 - **UI Components**: Radix UI + shadcn/ui
@@ -167,6 +178,7 @@ All database queries are in `lib/db-queries.ts`. Modify them to match your Hexis
 ### Styling
 
 The dashboard uses a dark "Data-Centric Futurism" theme. To customize:
+
 - Edit `app/globals.css` for color tokens
 - Modify component styles in each `.tsx` file
 - Update Tailwind configuration in `globals.css`
@@ -178,6 +190,7 @@ The dashboard uses a dark "Data-Centric Futurism" theme. To customize:
 **Error**: `Failed to fetch agent status`
 
 **Solutions**:
+
 1. Verify PostgreSQL is running: `docker ps`
 2. Test connection: `psql $DATABASE_URL -c "SELECT 1;"`
 3. Check firewall/port forwarding
@@ -190,6 +203,7 @@ If your dashboard loads but shows no data, your Hexis database might be empty. T
 ### Port Conflicts
 
 If port 3000 is already in use:
+
 ```bash
 npm run dev -- -p 3001
 ```
@@ -230,14 +244,27 @@ This dashboard can be deployed to Vercel and connect to your local Hexis databas
 
 ## Roadmap
 
-- [ ] Real-time heartbeat tracking from Hexis OODA loop
+### Completed ✓
+
+- [x] Real-time heartbeat tracking from Hexis
+- [x] Drive status monitoring
+- [x] Emotional state (VAD model) display
+- [x] Subconscious maintenance monitoring
+- [x] Memory tier counts
+
+### In Progress
+
 - [ ] Energy budget history and predictions
 - [ ] Goal creation and management UI
 - [ ] Chat interface with memory integration
 - [ ] Graph visualization using Apache AGE queries
+
+### Planned
+
 - [ ] Memory consolidation monitoring
 - [ ] MCP Bridge status monitoring
 - [ ] Export/backup functionality
+- [ ] Live data refresh (auto-polling)
 
 ## Contributing
 
@@ -250,6 +277,7 @@ This dashboard inherits the license from your Hexis fork.
 ## Support
 
 For issues specific to:
+
 - **This Dashboard**: Open an issue in your fork
 - **Hexis Core**: See the main Hexis repository
 - **Database Schema**: Check your `schema.sql` file

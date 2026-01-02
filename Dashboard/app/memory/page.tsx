@@ -3,6 +3,9 @@ import { SemanticMemories } from "@/components/semantic-memories"
 import { IdentityPanel } from "@/components/identity-panel"
 import { WorldviewGrid } from "@/components/worldview-grid"
 import { KnowledgeGraph3D } from "@/components/knowledge-graph-3d"
+import { SemanticDensityMap } from "@/components/semantic-density-map"
+import { InsightProgressBar } from "@/components/insight-progress-bar"
+import { MemoryDepthChart } from "@/components/memory-depth-chart"
 import { Brain } from "lucide-react"
 import Link from "next/link"
 import {
@@ -11,6 +14,9 @@ import {
   mockIdentityAspects,
   mockWorldviewBeliefs,
   mockKnowledgeGraph,
+  mockMemoryDynamics,
+  mockInsightProgress,
+  mockMemoryDistribution,
 } from "@/lib/mock-data"
 
 export default async function MemoryPage() {
@@ -56,6 +62,17 @@ export default async function MemoryPage() {
         <section>
           <h2 className="text-lg font-semibold text-foreground mb-4">Relationship Graphing</h2>
           <KnowledgeGraph3D graph={knowledgeGraph} />
+        </section>
+
+        <section className="space-y-4">
+          <h2 className="text-lg font-semibold text-foreground">Memory Dynamics</h2>
+          <div className="grid gap-4 md:grid-cols-2">
+            <SemanticDensityMap clusters={mockMemoryDynamics.semantic_density} />
+            <div className="space-y-4">
+              <InsightProgressBar progress={mockInsightProgress} />
+              <MemoryDepthChart data={mockMemoryDistribution} />
+            </div>
+          </div>
         </section>
 
         <div className="grid gap-6 lg:grid-cols-3">

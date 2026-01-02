@@ -64,7 +64,19 @@ SELECT priority, COUNT(*) as count
 FROM goals
 GROUP BY priority;
 ```
-
+### GOALS: Current state and staleness
+```sql
+SELECT 
+    id,
+    title,
+    priority,
+    progress,
+    created_at,
+    last_touched,
+    EXTRACT(EPOCH FROM (NOW() - last_touched))/3600 AS hours_since_touch
+FROM goals
+ORDER BY priority, created_at;
+```
 ---
 
 ## Viewing Memories
@@ -110,16 +122,17 @@ ORDER BY count DESC;
 ### Recent heartbeats (last 5)
 ```sql
 SELECT 
-    id,
     heartbeat_number,
     started_at,
+    ended_at,
     energy_start,
     energy_end,
-    narrative,
-    emotional_valence
+    actions_taken,
+    emotional_valence,
+    decision_reasoning
 FROM heartbeat_log
-ORDER BY started_at DESC
-LIMIT 5;
+ORDER BY heartbeat_number DESC
+LIMIT 10;
 ```
 
 ### Latest autonomous reasoning
