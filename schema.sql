@@ -111,8 +111,8 @@ CREATE TABLE procedural_memories (
     success_count INTEGER DEFAULT 0,
     total_attempts INTEGER DEFAULT 0,
     success_rate FLOAT GENERATED ALWAYS AS (
-        CASE WHEN total_attempts > 0 
-        THEN success_count::FLOAT / total_attempts::FLOAT 
+        CASE WHEN total_attempts > 0
+        THEN success_count::FLOAT / total_attempts::FLOAT
         ELSE 0 END
     ) STORED,
     average_duration INTERVAL,
@@ -399,7 +399,7 @@ CREATE TABLE embedding_config (
     value TEXT NOT NULL
 );
 
-INSERT INTO embedding_config (key, value) 
+INSERT INTO embedding_config (key, value)
 VALUES ('service_url', 'http://embeddings:80/embed')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
@@ -530,7 +530,7 @@ CREATE INDEX idx_embedding_cache_created ON embedding_cache (created_at);
 -- ============================================================================
 
 -- Calculate age in days (used for decay)
-CREATE OR REPLACE FUNCTION age_in_days(ts TIMESTAMPTZ) 
+CREATE OR REPLACE FUNCTION age_in_days(ts TIMESTAMPTZ)
 RETURNS FLOAT
 LANGUAGE sql
 IMMUTABLE
@@ -659,17 +659,17 @@ RETURNS vector AS $$
             SELECT jsonb_array_elements_text(embedding_json)::FLOAT
         );
 	    END IF;
-	
+
 	    -- Validate embedding size
 	    IF array_length(embedding_array, 1) IS NULL OR array_length(embedding_array, 1) != expected_dim THEN
 	        RAISE EXCEPTION 'Invalid embedding dimension: expected %, got %', expected_dim, array_length(embedding_array, 1);
 	    END IF;
-	
+
 	    -- Cache the result
 	    INSERT INTO embedding_cache (content_hash, embedding)
 	    VALUES (v_content_hash, embedding_array::vector)
 	    ON CONFLICT DO NOTHING;
-	
+
 	    RETURN embedding_array::vector;
 	EXCEPTION
 	    WHEN OTHERS THEN
@@ -755,8 +755,8 @@ CREATE TRIGGER trg_cluster_activation
 CREATE OR REPLACE FUNCTION mark_neighborhoods_stale()
 RETURNS TRIGGER AS $$
 BEGIN
-    UPDATE memory_neighborhoods 
-    SET is_stale = TRUE 
+    UPDATE memory_neighborhoods
+    SET is_stale = TRUE
     WHERE memory_id = NEW.id;
     RETURN NEW;
 END;
@@ -790,13 +790,13 @@ BEGIN
     LIMIT 1;
 
     -- If gap > 30 min or no episodes, start new episode
-    IF current_episode_id IS NULL OR 
+    IF current_episode_id IS NULL OR
        (last_memory_time IS NOT NULL AND NEW.created_at - last_memory_time > INTERVAL '30 minutes')
     THEN
         -- Close previous episode
         IF current_episode_id IS NOT NULL THEN
-            UPDATE episodes 
-            SET ended_at = last_memory_time 
+            UPDATE episodes
+            SET ended_at = last_memory_time
             WHERE id = current_episode_id;
         END IF;
 
@@ -804,13 +804,13 @@ BEGIN
         INSERT INTO episodes (started_at, episode_type)
         VALUES (NEW.created_at, 'autonomous')
         RETURNING id INTO current_episode_id;
-        
+
         new_seq := 1;
     ELSE
         -- Get next sequence number
-        SELECT COALESCE(MAX(sequence_order), 0) + 1 
-        INTO new_seq 
-        FROM episode_memories 
+        SELECT COALESCE(MAX(sequence_order), 0) + 1
+        INTO new_seq
+        FROM episode_memories
         WHERE episode_id = current_episode_id;
     END IF;
 
@@ -867,25 +867,25 @@ BEGIN
     END IF;
 
     -- Strategy 2: Exact content match (case-insensitive)
-    SELECT id INTO v_found_id 
-    FROM memories 
-    WHERE status = 'active' 
+    SELECT id INTO v_found_id
+    FROM memories
+    WHERE status = 'active'
       AND lower(content) = lower(btrim(p_ref))
     ORDER BY importance DESC, created_at DESC
     LIMIT 1;
-    
+
     IF v_found_id IS NOT NULL THEN
         RETURN v_found_id;
     END IF;
 
     -- Strategy 3: Partial content match (content contains reference)
-    SELECT id INTO v_found_id 
-    FROM memories 
-    WHERE status = 'active' 
+    SELECT id INTO v_found_id
+    FROM memories
+    WHERE status = 'active'
       AND lower(content) LIKE '%' || lower(btrim(p_ref)) || '%'
     ORDER BY importance DESC, created_at DESC
     LIMIT 1;
-    
+
     IF v_found_id IS NOT NULL THEN
         RETURN v_found_id;
     END IF;
@@ -895,9 +895,9 @@ BEGIN
     -- the closest matching memory even without exact string overlap
     BEGIN
         v_query_embedding := get_embedding(btrim(p_ref));
-        
+
         IF v_query_embedding IS NOT NULL THEN
-            SELECT 
+            SELECT
                 id,
                 1 - (embedding <=> v_query_embedding) as similarity
             INTO v_found_id, v_similarity
@@ -906,7 +906,7 @@ BEGIN
               AND embedding IS NOT NULL
             ORDER BY embedding <=> v_query_embedding
             LIMIT 1;
-            
+
             -- Only return if similarity exceeds threshold
             IF v_similarity >= v_similarity_threshold THEN
                 RETURN v_found_id;
@@ -916,12 +916,12 @@ BEGIN
         -- If embedding service fails, return NULL gracefully
         RETURN NULL;
     END;
-    
+
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION resolve_memory_reference(TEXT) IS 
+COMMENT ON FUNCTION resolve_memory_reference(TEXT) IS
 'Resolves a memory reference (UUID, content string, or abstract concept) to a memory ID.
 Resolution strategy: 1) UUID parse, 2) Exact match, 3) Partial match, 4) Vector similarity (threshold: 0.18).';
 
@@ -947,39 +947,39 @@ BEGIN
     END IF;
 
     -- Strategy 2: Exact title match
-    SELECT id INTO v_found_id 
-    FROM goals 
+    SELECT id INTO v_found_id
+    FROM goals
     WHERE lower(title) = lower(btrim(p_ref))
     ORDER BY last_touched DESC
     LIMIT 1;
-    
+
     IF v_found_id IS NOT NULL THEN
         RETURN v_found_id;
     END IF;
 
     -- Strategy 3: Partial title match
-    SELECT id INTO v_found_id 
-    FROM goals 
+    SELECT id INTO v_found_id
+    FROM goals
     WHERE lower(title) LIKE '%' || lower(btrim(p_ref)) || '%'
     ORDER BY last_touched DESC
     LIMIT 1;
-    
+
     IF v_found_id IS NOT NULL THEN
         RETURN v_found_id;
     END IF;
 
     -- Strategy 4: Partial description match
-    SELECT id INTO v_found_id 
-    FROM goals 
+    SELECT id INTO v_found_id
+    FROM goals
     WHERE lower(description) LIKE '%' || lower(btrim(p_ref)) || '%'
     ORDER BY last_touched DESC
     LIMIT 1;
-    
+
     RETURN v_found_id;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-COMMENT ON FUNCTION resolve_goal_reference(TEXT) IS 
+COMMENT ON FUNCTION resolve_goal_reference(TEXT) IS
 'Resolves a goal reference (UUID or title) to a goal ID.
 Resolution strategy: 1) UUID parse, 2) Exact title, 3) Partial title, 4) Partial description.';
 
@@ -1007,14 +1007,14 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	            current_valence := NULL;
 	    END;
 	    current_valence := COALESCE(current_valence, 0.0);
-	    
+
 	    RETURN QUERY
-	    WITH 
+	    WITH
     -- Vector seeds (semantic similarity)
 	    seeds AS (
-	        SELECT 
-	            m.id, 
-	            m.content, 
+	        SELECT
+	            m.id,
+	            m.content,
 	            m.type,
             m.importance,
             m.decay_rate,
@@ -1030,7 +1030,7 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	    ),
     -- Expand via precomputed neighborhoods
     associations AS (
-        SELECT 
+        SELECT
             (key)::UUID as mem_id,
             MAX((value::float) * s.sim) as assoc_score
         FROM seeds s
@@ -1061,7 +1061,7 @@ CREATE OR REPLACE FUNCTION fast_recall(
     ),
     -- Aggregate scores per memory
     scored AS (
-        SELECT 
+        SELECT
             c.mem_id,
             MAX(c.vector_score) as vector_score,
             MAX(c.assoc_score) as assoc_score,
@@ -1069,7 +1069,7 @@ CREATE OR REPLACE FUNCTION fast_recall(
         FROM candidates c
         GROUP BY c.mem_id
     )
-	    SELECT 
+	    SELECT
 	        m.id,
 	        m.content,
 	        m.type,
@@ -1085,7 +1085,7 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	            END) * 0.05,
 	            0.001
 	        ) as final_score,
-	        CASE 
+	        CASE
 	            WHEN sc.vector_score IS NOT NULL THEN 'vector'
 	            WHEN sc.assoc_score IS NOT NULL THEN 'association'
 	            WHEN sc.temp_score IS NOT NULL THEN 'temporal'
@@ -1511,11 +1511,11 @@ BEGIN
 
     -- Generate embedding
     embedding_vec := get_embedding(p_content);
-    
+
     INSERT INTO memories (type, content, embedding, importance, source_attribution, trust_level, trust_updated_at)
     VALUES (p_type, p_content, embedding_vec, p_importance, normalized_source, effective_trust, CURRENT_TIMESTAMP)
     RETURNING id INTO new_memory_id;
-    
+
     -- Create graph node
     EXECUTE format(
         'SELECT * FROM cypher(''memory_graph'', $q$
@@ -1526,7 +1526,7 @@ BEGIN
         p_type,
         CURRENT_TIMESTAMP
     );
-    
+
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -1554,15 +1554,15 @@ BEGIN
     END IF;
     effective_trust := COALESCE(p_trust_level, 0.95);
     new_memory_id := create_memory('episodic', p_content, p_importance, normalized_source, effective_trust);
-    
+
     INSERT INTO episodic_memories (
-        memory_id, action_taken, context, result, 
+        memory_id, action_taken, context, result,
         emotional_valence, event_time
     ) VALUES (
         new_memory_id, p_action_taken, p_context, p_result,
         p_emotional_valence, p_event_time
     );
-    
+
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -1599,7 +1599,7 @@ BEGIN
     effective_trust := COALESCE(p_trust_level, compute_semantic_trust(base_confidence, normalized_sources, 0.0));
 
     new_memory_id := create_memory('semantic', p_content, p_importance, primary_source, effective_trust);
-    
+
     INSERT INTO semantic_memories (
         memory_id, confidence, category, related_concepts,
         source_references, last_validated
@@ -1609,7 +1609,7 @@ BEGIN
     );
 
     PERFORM sync_memory_trust(new_memory_id);
-    
+
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -1634,13 +1634,13 @@ BEGIN
     END IF;
     effective_trust := COALESCE(p_trust_level, 0.70);
     new_memory_id := create_memory('procedural', p_content, p_importance, normalized_source, effective_trust);
-    
+
     INSERT INTO procedural_memories (
         memory_id, steps, prerequisites
     ) VALUES (
         new_memory_id, p_steps, p_prerequisites
     );
-    
+
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -1667,7 +1667,7 @@ BEGIN
     END IF;
     effective_trust := COALESCE(p_trust_level, 0.70);
     new_memory_id := create_memory('strategic', p_content, p_importance, normalized_source, effective_trust);
-    
+
     INSERT INTO strategic_memories (
         memory_id, pattern_description, confidence_score,
         supporting_evidence, context_applicability
@@ -1675,7 +1675,7 @@ BEGIN
         new_memory_id, p_pattern_description, p_confidence_score,
         p_supporting_evidence, p_context_applicability
     );
-    
+
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -1926,7 +1926,7 @@ DECLARE
 BEGIN
     query_embedding := get_embedding(p_query_text);
     zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
-    
+
     RETURN QUERY
     WITH candidates AS MATERIALIZED (
         SELECT m.id, m.content, m.type, m.embedding, m.importance
@@ -1951,7 +1951,7 @@ $$ LANGUAGE plpgsql;
 
 -- Assign memory to clusters based on similarity
 CREATE OR REPLACE FUNCTION assign_memory_to_clusters(
-    p_memory_id UUID, 
+    p_memory_id UUID,
     p_max_clusters INT DEFAULT 3
 ) RETURNS VOID AS $$
 DECLARE
@@ -1968,8 +1968,8 @@ BEGIN
     IF memory_embedding IS NULL OR memory_embedding = zero_vec THEN
         RETURN;
     END IF;
-    
-    FOR cluster_record IN 
+
+    FOR cluster_record IN
         SELECT id, 1 - (centroid_embedding <=> memory_embedding) as similarity
         FROM memory_clusters
         WHERE centroid_embedding IS NOT NULL
@@ -1981,7 +1981,7 @@ BEGIN
             INSERT INTO memory_cluster_members (cluster_id, memory_id, membership_strength)
             VALUES (cluster_record.id, p_memory_id, cluster_record.similarity)
             ON CONFLICT DO NOTHING;
-            
+
             assigned_count := assigned_count + 1;
         END IF;
     END LOOP;
@@ -2001,7 +2001,7 @@ BEGIN
     WHERE mcm.cluster_id = p_cluster_id
     AND m.status = 'active'
     AND mcm.membership_strength > 0.3;
-    
+
     UPDATE memory_clusters
     SET centroid_embedding = new_centroid,
         updated_at = CURRENT_TIMESTAMP
@@ -2053,6 +2053,46 @@ BEGIN
 END;
 $function$;
 
+-- Clean expired working memory (with optional consolidation before delete).
+-- CRITICAL: This function is called by run_subconscious_maintenance()
+CREATE OR REPLACE FUNCTION cleanup_working_memory_with_stats(
+    p_min_importance_to_promote FLOAT DEFAULT 0.75,
+    p_min_accesses_to_promote INT DEFAULT 3
+)
+RETURNS JSONB AS $$
+DECLARE
+    promoted UUID[] := ARRAY[]::uuid[];
+    rec RECORD;
+    deleted_count INT := 0;
+BEGIN
+    FOR rec IN
+        SELECT id, importance, access_count, promote_to_long_term
+        FROM working_memory
+        WHERE expiry < CURRENT_TIMESTAMP
+    LOOP
+        IF COALESCE(rec.promote_to_long_term, false)
+           OR COALESCE(rec.importance, 0) >= COALESCE(p_min_importance_to_promote, 0.75)
+           OR COALESCE(rec.access_count, 0) >= COALESCE(p_min_accesses_to_promote, 3)
+        THEN
+            promoted := array_append(promoted, promote_working_memory_to_episodic(rec.id, rec.importance));
+        END IF;
+    END LOOP;
+
+    WITH deleted AS (
+        DELETE FROM working_memory
+        WHERE expiry < CURRENT_TIMESTAMP
+        RETURNING 1
+    )
+    SELECT COUNT(*) INTO deleted_count FROM deleted;
+
+    RETURN jsonb_build_object(
+        'deleted_count', COALESCE(deleted_count, 0),
+        'promoted_count', COALESCE(array_length(promoted, 1), 0),
+        'promoted_ids', COALESCE(to_jsonb(promoted), '[]'::jsonb)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION cleanup_working_memory()
 RETURNS INT AS $$
 DECLARE
@@ -2101,7 +2141,7 @@ CREATE OR REPLACE FUNCTION add_to_working_memory(
 	        CURRENT_TIMESTAMP + p_expiry
 	    )
 	    RETURNING id INTO new_id;
-	    
+
 	    RETURN new_id;
 	END;
 	$$ LANGUAGE plpgsql;
@@ -2122,10 +2162,10 @@ CREATE OR REPLACE FUNCTION search_working_memory(
 	BEGIN
 	    query_embedding := get_embedding(p_query_text);
 	    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
-	    
+
 	    -- Clean expired first
 	    PERFORM cleanup_working_memory();
-	    
+
 	    RETURN QUERY
 	    WITH ranked AS (
 	        SELECT
@@ -2166,7 +2206,7 @@ BEGIN
         RETURNING 1
     )
     SELECT COUNT(*) INTO deleted_count FROM deleted;
-    
+
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
@@ -2176,7 +2216,7 @@ $$ LANGUAGE plpgsql;
 -- ============================================================================
 
 CREATE VIEW memory_health AS
-SELECT 
+SELECT
     type,
     COUNT(*) as total_memories,
     AVG(importance) as avg_importance,
@@ -2188,7 +2228,7 @@ WHERE status = 'active'
 GROUP BY type;
 
 CREATE VIEW cluster_insights AS
-SELECT 
+SELECT
     mc.id,
     mc.name,
     mc.cluster_type,
@@ -2203,7 +2243,7 @@ GROUP BY mc.id
 ORDER BY mc.importance_score DESC;
 
 CREATE VIEW episode_summary AS
-SELECT 
+SELECT
     e.id,
     e.started_at,
     e.ended_at,
@@ -2219,7 +2259,7 @@ GROUP BY e.id
 ORDER BY e.started_at DESC;
 
 CREATE VIEW stale_neighborhoods AS
-SELECT 
+SELECT
     mn.memory_id,
     m.content,
     m.type,
@@ -2723,6 +2763,20 @@ CREATE TABLE maintenance_state (
 
 INSERT INTO maintenance_state (id) VALUES (1);
 
+-- Maintenance run history for dashboard visualization
+CREATE TABLE maintenance_log (
+    id SERIAL PRIMARY KEY,
+    ran_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    neighborhoods_recomputed INT DEFAULT 0,
+    embedding_cache_deleted INT DEFAULT 0,
+    working_memory_deleted INT DEFAULT 0,
+    working_memory_promoted INT DEFAULT 0,
+    success BOOLEAN DEFAULT TRUE,
+    error_message TEXT
+);
+
+CREATE INDEX idx_maintenance_log_ran_at ON maintenance_log (ran_at DESC);
+
 -- ============================================================================
 -- HEARTBEAT LOG
 -- ============================================================================
@@ -2962,6 +3016,23 @@ BEGIN
     SET last_maintenance_at = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
+
+    -- Log the maintenance run for dashboard
+    INSERT INTO maintenance_log (
+        ran_at,
+        neighborhoods_recomputed,
+        embedding_cache_deleted,
+        working_memory_deleted,
+        working_memory_promoted,
+        success
+    ) VALUES (
+        CURRENT_TIMESTAMP,
+        COALESCE(recomputed, 0),
+        COALESCE(cache_deleted, 0),
+        COALESCE(NULLIF(wm_stats->>'deleted_count', '')::int, 0),
+        COALESCE(NULLIF(wm_stats->>'promoted_count', '')::int, 0),
+        true
+    );
 
     PERFORM pg_advisory_unlock(hashtext('agi_subconscious_maintenance'));
 
@@ -4599,7 +4670,7 @@ BEGIN
             BEGIN
                 from_id := NULLIF(rel->>'from_id', '')::uuid;
                 to_id := NULLIF(rel->>'to_id', '')::uuid;
-                
+
                 -- Map LLM relationship types to valid enum values
                 rel_type := CASE LOWER(rel->>'type')
                     WHEN 'resolves' THEN 'DERIVED_FROM'
@@ -4619,7 +4690,7 @@ BEGIN
                     WHEN 'associated' THEN 'ASSOCIATED'
                     ELSE 'ASSOCIATED'  -- fallback for unknown types
                 END::graph_edge_type;
-                
+
                 rel_conf := COALESCE((rel->>'confidence')::float, 0.8);
                 IF from_id IS NOT NULL AND to_id IS NOT NULL THEN
                     PERFORM discover_relationship(from_id, to_id, rel_type, rel_conf, 'reflection', p_heartbeat_id, 'reflect');
@@ -4964,7 +5035,7 @@ BEGIN
             BEGIN
                 v_from_raw := p_params->>'from_id';
                 v_to_raw := p_params->>'to_id';
-                
+
                 -- Try to resolve references (UUID or semantic label)
                 v_from := resolve_memory_reference(v_from_raw);
                 v_to := resolve_memory_reference(v_to_raw);
@@ -5052,7 +5123,7 @@ BEGIN
                 -- Accept both 'goal_id' and 'goal' keys (LLM sometimes uses either)
                 v_goal_raw := COALESCE(p_params->>'goal_id', p_params->>'goal');
                 v_goal_id := resolve_goal_reference(v_goal_raw);
-                
+
                 IF v_goal_id IS NULL THEN
                     -- Salvage the intent
                     remembered_id := create_episodic_memory(
@@ -5074,7 +5145,7 @@ BEGIN
                         'goal_raw', v_goal_raw
                     );
                 END IF;
-                
+
                 PERFORM change_goal_priority(
                     v_goal_id,
                     (p_params->>'new_priority')::goal_priority,
