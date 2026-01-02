@@ -9,4 +9,5 @@ local-memory-system/
 ├── backups/                  # DB dumps only
 ├── db/migrations/            # SQL patches and schema history
 ├── prompts/                  # Personhood prompts (used by code)
+├── Dashboard/                # Dashboard related files
 └── reference/                # Eric's design rationale (quirks.md, AGE docs)

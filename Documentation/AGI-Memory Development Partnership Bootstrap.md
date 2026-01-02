@@ -1,4 +1,4 @@
-# AGI Memory Development Partnership Bootstrap - Dec 2025
+# AGI Memory Development Partnership Bootstrap - Jan 2026
 
 ## Partnership Context
 
@@ -96,6 +96,7 @@
     	* Linux virtual environment (WSL)
     	* Database location:  Docker volume (managed by Docker Desktop, persists until `docker compose down -v`)
     		{`local-memory-system_postgres_data`}
+		* Dashboard system with node.js (details to be provided later)
     	* Claude Desktop with MCP enabled
     	* Batch Files:  StartAGIMemory.bat; StopAGIMemory.bat
     - Connection Info
@@ -138,7 +139,7 @@
 
 **Database State** 
 	- Status: CLEAN RESET as of [29 Dec 2025] / POPULATED with [9] memories 
-	- Last backup: [29 Dec 2025]
+	- Last backup: [1 Jan 2026]
 
 ## Known Failure Modes & Protections
 
