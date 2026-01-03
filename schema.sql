@@ -3849,7 +3849,7 @@ BEGIN
           AND EXISTS (
               SELECT 1
               FROM jsonb_array_elements_text(b.trigger_patterns) pat(p)
-              WHERE p_content ILIKE ('%' || pat.p || '%')
+              WHERE p_content ~* (E'\\m' || pat.p || E'\\M')
           )
     ),
     all_matches AS (
