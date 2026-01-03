@@ -3231,6 +3231,61 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Get goal-relevant metrics for visibility
+CREATE OR REPLACE FUNCTION get_goal_metrics(p_goal_id UUID, p_title TEXT, p_description TEXT)
+RETURNS JSONB AS $$
+DECLARE
+    metrics JSONB := '{}'::jsonb;
+    rel_count INT;
+    worldview_count INT;
+    target_match TEXT[];
+    target_num INT;
+BEGIN
+    -- Check if goal is about relationships/connections
+    IF p_title ILIKE '%relationship%' OR p_title ILIKE '%connect%'
+       OR p_description ILIKE '%relationship%' OR p_description ILIKE '%connect%' THEN
+        SELECT COUNT(*) INTO rel_count FROM relationship_discoveries;
+
+        -- Try to extract target number from description
+        target_match := regexp_match(p_description, 'at least (\d+)|(\d+) .*relationship|(\d+) .*connection', 'i');
+        IF target_match IS NOT NULL THEN
+            target_num := COALESCE(target_match[1], target_match[2], target_match[3])::INT;
+            metrics := metrics || jsonb_build_object(
+                'relationships_created', rel_count,
+                'target', target_num,
+                'target_met', rel_count >= target_num
+            );
+        ELSE
+            metrics := metrics || jsonb_build_object('relationships_created', rel_count);
+        END IF;
+    END IF;
+
+    -- Check if goal is about worldview beliefs
+    IF p_title ILIKE '%worldview%' OR p_title ILIKE '%belief%'
+       OR p_description ILIKE '%worldview%' OR p_description ILIKE '%belief%' THEN
+        SELECT COUNT(*) INTO worldview_count FROM worldview;
+
+        target_match := regexp_match(p_description, 'at least (\d+)|(\d+) .*belief|(\d+) .*worldview', 'i');
+        IF target_match IS NOT NULL THEN
+            target_num := COALESCE(target_match[1], target_match[2], target_match[3])::INT;
+            metrics := metrics || jsonb_build_object(
+                'worldview_beliefs', worldview_count,
+                'target', target_num,
+                'target_met', worldview_count >= target_num
+            );
+        ELSE
+            metrics := metrics || jsonb_build_object('worldview_beliefs', worldview_count);
+        END IF;
+    END IF;
+
+    IF metrics = '{}'::jsonb THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN metrics;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Get goals snapshot
 CREATE OR REPLACE FUNCTION get_goals_snapshot()
 RETURNS JSONB AS $$
@@ -3242,7 +3297,7 @@ DECLARE
 BEGIN
     SELECT value INTO stale_days FROM heartbeat_config WHERE key = 'goal_stale_days';
 
-    -- Active goals
+    -- Active goals (now with metrics)
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id', id,
         'title', title,
@@ -3250,7 +3305,8 @@ BEGIN
         'due_at', due_at,
         'last_touched', last_touched,
         'progress_count', jsonb_array_length(progress),
-        'blocked_by', blocked_by
+        'blocked_by', blocked_by,
+        'metrics', get_goal_metrics(id, title, description)
     )), '[]'::jsonb)
     INTO active_goals
     FROM goals

@@ -161,37 +161,6 @@ export function RuminationTicker({ ruminations, maintenanceState }: RuminationTi
           </div>
         </div>
       )}
-
-      {/* Rumination Stream */}
-      {ruminations.length > 0 ? (
-        <div
-          ref={scrollRef}
-          className="h-[200px] overflow-hidden space-y-2"
-          onMouseEnter={() => setIsPaused(true)}
-          onMouseLeave={() => setIsPaused(false)}
-        >
-          {doubledRuminations.map((entry, index) => (
-            <div key={`${entry.id}-${index}`} className="p-2 rounded-lg bg-background/30 border border-border/30">
-              <div className="flex items-center gap-2 mb-1">
-                <span className={`text-xs font-mono font-semibold ${getCategoryColor(entry.category)}`}>
-                  {entry.category.toUpperCase()}
-                </span>
-                <span className="text-xs text-muted-foreground">{new Date(entry.timestamp).toLocaleTimeString()}</span>
-              </div>
-              <p className="text-xs text-foreground leading-relaxed">{entry.content}</p>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="h-[200px] flex items-center justify-center">
-          <p className="text-xs text-muted-foreground italic text-center">
-            {maintenanceState?.isPaused
-              ? "Maintenance paused — memories not being consolidated"
-              : "Quietly consolidating and organizing memories..."
-            }
-          </p>
-        </div>
-      )}
     </Card>
   )
 }

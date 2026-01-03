@@ -76,7 +76,7 @@ export function ChatInterface() {
   // Initial fetch and polling
   useEffect(() => {
     fetchOutbox()
-    const interval = setInterval(fetchOutbox, 15000) // Poll every 15 seconds
+    const interval = setInterval(fetchOutbox, 900000) // Poll every 15 minutes
     return () => clearInterval(interval)
   }, [])
 

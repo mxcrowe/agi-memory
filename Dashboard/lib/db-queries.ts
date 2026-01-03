@@ -182,6 +182,69 @@ export async function getMaintenanceState() {
   }
 }
 
+// Get recent actions from heartbeat log
+export async function getRecentActions(limit = 30) {
+  const results = await sql`
+    SELECT
+      heartbeat_number,
+      started_at,
+      actions_taken
+    FROM heartbeat_log
+    WHERE actions_taken IS NOT NULL
+      AND jsonb_array_length(actions_taken) > 0
+    ORDER BY started_at DESC
+    LIMIT ${limit}
+  `
+
+  // Flatten actions from multiple heartbeats
+  const actions: {
+    heartbeatNumber: number
+    timestamp: Date
+    action: string
+    params?: Record<string, unknown>
+    cost?: number
+  }[] = []
+
+  for (const row of results) {
+    const actionsArray = row.actions_taken as { action: string; params?: Record<string, unknown>; cost?: number }[]
+    for (const a of actionsArray) {
+      actions.push({
+        heartbeatNumber: row.heartbeat_number,
+        timestamp: row.started_at,
+        action: a.action,
+        params: a.params,
+        cost: a.cost,
+      })
+    }
+  }
+
+  return actions
+}
+
+// Get goals from goals_snapshot
+export async function getGoals() {
+  const [result] = await sql`SELECT get_goals_snapshot() as snapshot`
+  const snapshot = result?.snapshot || { active: [], queued: [], issues: [], counts: { active: 0, queued: 0, backburner: 0 } }
+
+  return {
+    active: snapshot.active as {
+      id: string
+      title: string
+      description: string
+      due_at: string | null
+      last_touched: string
+      progress_count: number
+      blocked_by: string | null
+      metrics: { target?: number; target_met?: boolean; relationships_created?: number; worldview_beliefs?: number } | null
+    }[],
+    queued: snapshot.queued as { id: string; title: string; source: string; due_at: string | null }[],
+    issues: snapshot.issues as { goal_id: string; title: string; issue: string; due_at: string | null; days_since_touched: number }[],
+    counts: snapshot.counts as { active: number; queued: number; backburner: number },
+  }
+}
+
+
+
 
 // Get recent heartbeat log entries
 export async function getRecentHeartbeats(limit = 15) {

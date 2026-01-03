@@ -1,5 +1,5 @@
 import { AgentStatusCard } from "@/components/agent-status-card"
-import { EnergyChart } from "@/components/energy-chart"
+import { RecentActions } from "@/components/recent-actions"
 import { GoalsList } from "@/components/goals-list"
 import { HeartbeatMonitor } from "@/components/heartbeat-monitor"
 import { PulseIndicator } from "@/components/pulse-indicator"
@@ -12,7 +12,7 @@ import { MemoryDepthChart } from "@/components/memory-depth-chart"
 import { DriveStatus } from "@/components/drive-status"
 import { Brain } from "lucide-react"
 import Link from "next/link"
-import { getAgentStatus, getHeartbeatState, getRecentHeartbeats, getDriveStatus, getMaintenanceState } from "@/lib/db-queries"
+import { getAgentStatus, getHeartbeatState, getRecentHeartbeats, getDriveStatus, getMaintenanceState, getRecentActions, getGoals } from "@/lib/db-queries"
 
 // Helper to safely fetch data with fallback
 async function fetchWithFallback<T>(fetcher: () => Promise<T>, fallback: T): Promise<T> {
@@ -58,8 +58,11 @@ export default async function DashboardPage() {
     affective_state: heartbeatState.affectiveState,
   }
 
-  // Placeholder data for components not yet wired up
-  const goals: { id: string; title: string; priority: string; progress: number }[] = []
+  // Fetch goals data
+  const goals = await fetchWithFallback(getGoals, {
+    active: [], queued: [], issues: [],
+    counts: { active: 0, queued: 0, backburner: 0 }
+  })
 
   // Fetch real heartbeat entries
   const heartbeatEntries = await fetchWithFallback(getRecentHeartbeats, [])
@@ -155,7 +158,7 @@ export default async function DashboardPage() {
 
 
 
-            <EnergyChart />
+            <RecentActions actions={await fetchWithFallback(getRecentActions, [])} />
             <GoalsList goals={goals} />
           </div>
 
