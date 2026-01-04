@@ -1,7 +1,7 @@
 "use client"
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Activity, Brain, Zap, Link2, RefreshCw, Coffee, Search, MessageSquare } from "lucide-react"
+import { Sparkles, Brain, Zap, Link2, RefreshCw, Coffee, Search, MessageSquare } from "lucide-react"
 
 interface ActionEntry {
   heartbeatNumber: number
@@ -15,7 +15,7 @@ interface RecentActionsProps {
   actions: ActionEntry[]
 }
 
-const actionIcons: Record<string, typeof Activity> = {
+const actionIcons: Record<string, typeof Sparkles> = {
   recall: Search,
   reflect: Brain,
   connect: Link2,
@@ -55,23 +55,72 @@ export function RecentActions({ actions }: RecentActionsProps) {
     const params = action.params || {}
     switch (action.action) {
       case 'recall':
-        return params.query ? `"${String(params.query).slice(0, 40)}..."` : 'Memory retrieval'
-      case 'reflect':
-        return params.aspect ? `On ${params.aspect}` : 'Self-reflection'
+        if (params.query) {
+          const query = String(params.query)
+          return query.length > 80 ? `"${query.slice(0, 80)}..."` : `"${query}"`
+        }
+        return 'Retrieving from memory'
+      case 'reflect': {
+        const reflectMessages = [
+          'Examining recent patterns and experiences...',
+          'Checking for contradictions in worldview...',
+          'Updating self-model based on observations...',
+          'Analyzing identity coherence...',
+          'Synthesizing insights from recent activity...',
+        ]
+        // Use timestamp to pick a message (different per entry)
+        const msgIndex = new Date(action.timestamp).getSeconds() % reflectMessages.length
+        return reflectMessages[msgIndex]
+      }
+      case 'synthesize': {
+        // Build a rich summary: topic or first sentence + source count
+        const sources = Array.isArray(params.sources) ? params.sources : []
+        const sourceCount = sources.length > 0 ? ` (${sources.length} sources)` : ''
+
+        if (params.topic) {
+          const topic = String(params.topic)
+          return `Synthesized: ${topic.slice(0, 60)}${topic.length > 60 ? '...' : ''}${sourceCount}`
+        }
+        if (params.content) {
+          // Extract first sentence or first 60 chars
+          const content = String(params.content)
+          const firstSentence = content.split(/[.!?]/)[0]?.trim() || content
+          const display = firstSentence.length > 60 ? `${firstSentence.slice(0, 60)}...` : firstSentence
+          return `Synthesized: ${display}${sourceCount}`
+        }
+        return `Synthesized semantic memory${sourceCount}`
+      }
       case 'connect':
-        return 'Created memory relationship'
+        if (params.relationship_type) {
+          return `Linking memories: ${params.relationship_type}`
+        }
+        return 'Creating relationship between memories'
       case 'maintain':
-        return String(params.operation || 'Maintenance operation')
+        if (params.worldview_id) {
+          return `Updating worldview belief confidence`
+        }
+        return String(params.operation || 'Internal maintenance')
       case 'rest':
-        return 'Energy conservation'
+        return 'Conserving energy — allowing passive regeneration'
       case 'reach_out_user':
-        return 'Reached out to user'
+        if (params.intent) {
+          return `To user: ${params.intent}`
+        }
+        return 'Initiating contact with user'
       case 'reach_out_public':
-        return 'Public post queued'
+        return 'Queuing public post'
       case 'reprioritize':
-        return String(params.action || 'Goal management')
+        const priority = params.new_priority ? ` → ${params.new_priority}` : ''
+        const reason = params.reason ? `: ${String(params.reason).slice(0, 50)}` : ''
+        return `Goal${priority}${reason}` || 'Adjusting goal priorities'
+      case 'brainstorm_goals':
+        return 'Generating self-directed goals based on current state'
+      case 'inquire_shallow':
+        return params.question ? `Quick lookup: "${String(params.question).slice(0, 50)}"` : 'Quick information lookup'
+      case 'inquire_deep':
+        return params.question ? `Deep research: "${String(params.question).slice(0, 50)}"` : 'Comprehensive research query'
       default:
-        return action.action
+        return action.action.replace(/_/g, ' ')
     }
   }
 
@@ -79,7 +128,7 @@ export function RecentActions({ actions }: RecentActionsProps) {
     <Card className="border-border/50">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <Activity className="h-5 w-5" />
+          <Sparkles className="h-5 w-5" />
           Recent Actions
         </CardTitle>
         <CardDescription>Actions taken in recent heartbeats</CardDescription>
@@ -92,7 +141,7 @@ export function RecentActions({ actions }: RecentActionsProps) {
             </p>
           ) : (
             actions.map((entry, idx) => {
-              const Icon = actionIcons[entry.action] || Activity
+              const Icon = actionIcons[entry.action] || Sparkles
               const color = actionColors[entry.action] || "text-muted-foreground"
 
               return (
