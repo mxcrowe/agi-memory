@@ -72,8 +72,11 @@ DB_CONFIG = {
 # LLM configuration (defaults; may be overridden by DB config via `agi init`)
 DEFAULT_LLM_PROVIDER = os.getenv(
     "LLM_PROVIDER", "openai"
-)  # openai|anthropic|openai_compatible|ollama
+)  # openai|anthropic|openai_compatible|openrouter|ollama
 DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost")
+OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "Hexis")
 
 # Worker configuration
 POLL_INTERVAL = float(os.getenv("WORKER_POLL_INTERVAL", 1.0))  # seconds
@@ -161,6 +164,8 @@ class HeartbeatWorker:
         self.llm_base_url: str | None = os.getenv("OPENAI_BASE_URL") or None
         self.llm_api_key: str | None = os.getenv("OPENAI_API_KEY") or os.getenv(
             "ANTHROPIC_API_KEY"
+        ) or os.getenv(
+            "OPENROUTER_API_KEY"
         )
 
         self.llm_client = None
@@ -177,6 +182,9 @@ class HeartbeatWorker:
         if provider == "ollama":
             base_url = base_url or "http://localhost:11434/v1"
             api_key = api_key or "ollama"
+        if provider == "openrouter":
+            base_url = base_url or OPENROUTER_BASE_URL
+            api_key = api_key or os.getenv("OPENROUTER_API_KEY")
 
         self.llm_provider = provider or "openai"
         self.llm_model = model or "gpt-4o"
@@ -215,6 +223,11 @@ class HeartbeatWorker:
             kwargs = {"api_key": self.llm_api_key}
             if self.llm_base_url:
                 kwargs["base_url"] = self.llm_base_url
+            if self.llm_provider == "openrouter":
+                kwargs["default_headers"] = {
+                    "HTTP-Referer": OPENROUTER_REFERER,
+                    "X-Title": OPENROUTER_TITLE,
+                }
             self.llm_client = openai.OpenAI(**kwargs)
         except Exception as e:
             logger.warning(f"Failed to initialize OpenAI client: {e}")
@@ -288,11 +301,19 @@ class HeartbeatWorker:
             api_key_env = str(cfg.get("api_key_env") or "").strip()
             api_key = os.getenv(api_key_env) if api_key_env else None
             if not api_key:
-                api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+                if provider.lower() == "openrouter":
+                    api_key = os.getenv("OPENROUTER_API_KEY")
+                else:
+                    api_key = os.getenv("OPENAI_API_KEY") or os.getenv(
+                        "ANTHROPIC_API_KEY"
+                    )
 
             self.llm_provider = provider
             self.llm_model = model
-            self.llm_base_url = endpoint or (os.getenv("OPENAI_BASE_URL") or None)
+            if provider.lower() == "openrouter":
+                self.llm_base_url = endpoint or OPENROUTER_BASE_URL
+            else:
+                self.llm_base_url = endpoint or (os.getenv("OPENAI_BASE_URL") or None)
             self.llm_api_key = api_key
             self._init_llm_client()
             return
@@ -300,7 +321,11 @@ class HeartbeatWorker:
         self.llm_provider = DEFAULT_LLM_PROVIDER
         self.llm_model = DEFAULT_LLM_MODEL
         self.llm_base_url = os.getenv("OPENAI_BASE_URL") or None
-        self.llm_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+        self.llm_api_key = os.getenv("OPENAI_API_KEY") or os.getenv(
+            "ANTHROPIC_API_KEY"
+        ) or os.getenv(
+            "OPENROUTER_API_KEY"
+        )
         self._init_llm_client()
 
     # -------------------------------------------------------------------------
@@ -718,26 +743,47 @@ class HeartbeatWorker:
             )
             raw = response.content[0].text
         elif HAS_OPENAI:
-            response = self.llm_client.chat.completions.create(
-                model=self.llm_model or "gpt-4o",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            try:
+                response = self.llm_client.chat.completions.create(
+                    model=self.llm_model or "gpt-4o",
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_tokens=max_tokens,
+                )
+                raw = response.choices[0].message.content
+            except Exception:
+                if self.llm_provider in {"openrouter", "openai_compatible", "ollama"}:
+                    response = self.llm_client.chat.completions.create(
+                        model=self.llm_model or "gpt-4o",
+                        messages=messages,
+                        max_tokens=max_tokens,
+                    )
+                    raw = response.choices[0].message.content
+                else:
+                    raise
         else:
             raise RuntimeError("No LLM provider available.")
 
         try:
-            return json.loads(raw), raw
+            raw_text = (raw or "").strip()
+            if raw_text.startswith("```"):
+                import re
+
+                raw_text = re.sub(
+                    r"^```(?:json)?\\s*", "", raw_text, flags=re.IGNORECASE
+                )
+                raw_text = re.sub(r"\\s*```$", "", raw_text)
+            return json.loads(raw_text), raw
         except json.JSONDecodeError:
             import re
 
-            json_match = re.search(r"\{[\s\S]*\}", raw)
+            json_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw_text)
             if json_match:
-                return json.loads(json_match.group()), raw
+                return json.loads(json_match.group(1)), raw
             return fallback, raw
 
     def _build_decision_prompt(self, context: dict) -> str:
@@ -967,6 +1013,88 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 lines.append(f"  - {action}: {int(cost)}")
         return "\n".join(lines)
 
+    def _prepare_synthesis_params(
+        self, params: dict, recall_memories: list[dict]
+    ) -> dict:
+        if not recall_memories:
+            return params
+
+        topic = (params.get("topic") or "general").strip()
+        recall_items = self._format_recall_for_synthesis(recall_memories)
+        if not recall_items:
+            return params
+
+        fallback_content = (params.get("content") or "").strip()
+        fallback = {
+            "content": fallback_content,
+            "confidence": params.get("confidence") or 0.6,
+            "sources": self._default_synthesis_sources(recall_items),
+        }
+
+        system_prompt = (
+            "You are synthesizing insights from recalled memories for an autonomous agent.\n"
+            "Return STRICT JSON with shape:\n"
+            '{ "content": string, "confidence": number, "sources": [{"memory_id": string, "score": number|null}] }\n'
+            "The content must be a concise synthesis grounded in the recall items."
+        )
+        user_prompt = (
+            f"Topic: {topic}\n\n"
+            "Recall memories (JSON):\n"
+            f"{json.dumps(recall_items)[:8000]}"
+        )
+
+        doc, _raw = self._call_llm_json(
+            system_prompt, user_prompt, max_tokens=1200, fallback=fallback
+        )
+        if not isinstance(doc, dict):
+            return params
+
+        content = (doc.get("content") or "").strip()
+        if not content:
+            return params
+
+        new_params = dict(params)
+        new_params["content"] = content
+        if doc.get("confidence") is not None:
+            try:
+                new_params["confidence"] = float(doc.get("confidence"))
+            except Exception:
+                pass
+        sources = doc.get("sources")
+        if isinstance(sources, list):
+            new_params["sources"] = sources
+        elif "sources" not in new_params:
+            new_params["sources"] = self._default_synthesis_sources(recall_items)
+        return new_params
+
+    def _format_recall_for_synthesis(self, recall_memories: list[dict]) -> list[dict]:
+        items: list[dict] = []
+        for mem in recall_memories[:6]:
+            if not isinstance(mem, dict):
+                continue
+            content = (mem.get("content") or "").strip()
+            if not content:
+                continue
+            mid = mem.get("memory_id") or mem.get("id")
+            item = {
+                "id": str(mid) if mid else None,
+                "content": content[:500],
+                "type": mem.get("memory_type") or mem.get("type"),
+                "score": mem.get("score"),
+                "source": mem.get("source"),
+            }
+            items.append(item)
+        return items
+
+    def _default_synthesis_sources(self, recall_items: list[dict]) -> list[dict]:
+        sources: list[dict] = []
+        for item in recall_items:
+            mid = item.get("id")
+            if not mid:
+                continue
+            sources.append({"memory_id": mid, "score": item.get("score")})
+        return sources
+
     async def execute_heartbeat_actions(self, heartbeat_id: str, decision: dict):
         """Execute the actions decided by the LLM and complete the heartbeat."""
         actions = decision.get("actions", [])
@@ -974,11 +1102,18 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         reasoning = decision.get("reasoning", "")
 
         actions_taken = []
+        recall_memories: list[dict] = []
 
         async with self.pool.acquire() as conn:
             for action_spec in actions:
                 action = action_spec.get("action", "rest")
                 params = action_spec.get("params", {})
+
+                if action == "synthesize" and recall_memories:
+                    try:
+                        params = self._prepare_synthesis_params(params, recall_memories)
+                    except Exception as e:
+                        logger.warning(f"Failed to prepare synthesis content: {e}")
 
                 # Execute the action via the database function
                 result = await conn.fetchval(
@@ -991,6 +1126,12 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 )
 
                 result_dict = json.loads(result) if result else {}
+                if action == "recall" and isinstance(result_dict, dict):
+                    recall_payload = (result_dict.get("result") or {}).get("memories")
+                    if isinstance(recall_payload, list):
+                        recall_memories.extend(
+                            mem for mem in recall_payload if isinstance(mem, dict)
+                        )
                 # If this action queued an LLM call (e.g., brainstorm/inquire), process it immediately
                 queued_call_id = (
                     (result_dict.get("result") or {}).get("external_call_id")

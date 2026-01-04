@@ -192,7 +192,7 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
 
         print("\nModel configuration (stored in DB; worker will also use env vars for keys).")
         hb_provider = _prompt(
-            "Heartbeat model provider (openai|anthropic|openai_compatible|ollama)",
+            "Heartbeat model provider (openai|anthropic|openai_compatible|openrouter|ollama)",
             default=os.getenv("LLM_PROVIDER", "openai"),
             required=True,
         )
@@ -209,7 +209,7 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
         )
 
         chat_provider = _prompt(
-            "Chat model provider (openai|anthropic|openai_compatible|ollama)",
+            "Chat model provider (openai|anthropic|openai_compatible|openrouter|ollama)",
             default=hb_provider,
             required=True,
         )
