@@ -245,20 +245,27 @@ WHERE key = 'maintenance_interval_seconds';
 
 ---
 
-## Switch LLM Models
+### Switch LLM Models
 
-### Use Claude 3.5 Haiku (current - cheapest capable model)
+## Select Model from OpenRouter (e.g., ChatGPT 4o-mini)
 ```sql
-UPDATE config 
-SET value = '{"model": "claude-3-5-haiku-20241022", "endpoint": "", "provider": "anthropic", "api_key_env": ""}'::jsonb
-WHERE key IN ('llm.chat', 'llm.heartbeat');
+SELECT set_config(
+  'llm.heartbeat',
+  jsonb_set(get_config('llm.heartbeat')::jsonb, '{model}', '"openai/gpt-4o-mini"')
+);
 ```
 
-### Use Claude Sonnet 4 (most capable, expensive)
+### Use Claude Sonnet 4 Direct from Anthropic (most capable, expensive)
 ```sql
-UPDATE config 
-SET value = '{"model": "claude-sonnet-4-20250514", "endpoint": "", "provider": "anthropic", "api_key_env": ""}'::jsonb
-WHERE key IN ('llm.chat', 'llm.heartbeat');
+SELECT set_config(
+  'llm.heartbeat',
+  '{"model":"claude-sonnet-4-5-20250929","endpoint":"","provider":"anthropic","api_key_env":"ANTHROPIC_API_KEY"}'::jsonb
+);
+
+SELECT set_config(
+  'llm.chat',
+  '{"model":"claude-sonnet-4-claude-sonnet-4-5-20250929","endpoint":"","provider":"anthropic","api_key_env":"ANTHROPIC_API_KEY"}'::jsonb
+);
 ```
 
 **After changing models, restart the worker:**
