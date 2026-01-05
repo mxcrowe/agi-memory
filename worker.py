@@ -190,6 +190,12 @@ class HeartbeatWorker:
         self.llm_model = model or "gpt-4o"
         self.llm_base_url = base_url
         self.llm_api_key = api_key
+        logger.info(
+            "LLM config: provider=%s model=%s base_url=%s",
+            self.llm_provider,
+            self.llm_model,
+            self.llm_base_url or "",
+        )
 
         self.llm_client = None
         if self.llm_provider == "anthropic":
