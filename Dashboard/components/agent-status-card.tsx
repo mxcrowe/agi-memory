@@ -1,66 +1,99 @@
-"use client"
+"use client";
 
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
-import { Activity, Brain, Zap, Target, Heart, Sparkles } from "lucide-react"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import {
+  Activity,
+  Brain,
+  Zap,
+  Target,
+  Heart,
+  Sparkles,
+  TrendingUp,
+  TrendingDown,
+  Minus,
+} from "lucide-react";
 
 interface AffectiveState {
-  valence: number
-  arousal: number
-  dominance: number
-  primaryEmotion: string
+  valence: number;
+  arousal: number;
+  dominance: number;
+  primaryEmotion: string;
+  valenceTrend?: "up" | "down" | "flat";
+  arousalTrend?: "up" | "down" | "flat";
+  dominanceTrend?: "up" | "down" | "flat";
 }
 
 interface AgentStatusCardProps {
   status: {
-    name: string
-    status: "active" | "idle" | "sleeping" | "error"
-    total_memories: number
-    current_energy: number
-    max_energy: number
-    last_heartbeat: Date
-    active_goals: number
-    llm_model: string
-    affective_state: AffectiveState
-  }
+    name: string;
+    status: "active" | "idle" | "sleeping" | "error";
+    total_memories: number;
+    current_energy: number;
+    max_energy: number;
+    last_heartbeat: Date;
+    active_goals: number;
+    llm_model: string;
+    affective_state: AffectiveState;
+  };
+  energyBreakdown?: {
+    heartbeatNumber: number;
+    energyStart: number;
+    energyEnd: number;
+    totalCost: number;
+    recharge: number;
+    actionCosts: { action: string; cost: number }[];
+  };
 }
 
-export function AgentStatusCard({ status }: AgentStatusCardProps) {
-  const energyPercent = (status.current_energy / status.max_energy) * 100
-  const timeSinceHeartbeatMinutes = Math.floor((Date.now() - new Date(status.last_heartbeat).getTime()) / 60000)
+export function AgentStatusCard({
+  status,
+  energyBreakdown,
+}: AgentStatusCardProps) {
+  const energyPercent = (status.current_energy / status.max_energy) * 100;
+  const timeSinceHeartbeatMinutes = Math.floor(
+    (Date.now() - new Date(status.last_heartbeat).getTime()) / 60000
+  );
 
   const getStatusColor = () => {
     switch (status.status) {
       case "active":
-        return "bg-accent text-accent-foreground"
+        return "bg-accent text-accent-foreground";
       case "idle":
-        return "bg-muted text-muted-foreground"
+        return "bg-muted text-muted-foreground";
       case "sleeping":
-        return "bg-secondary text-secondary-foreground"
+        return "bg-secondary text-secondary-foreground";
       case "error":
-        return "bg-destructive text-destructive-foreground"
+        return "bg-destructive text-destructive-foreground";
       default:
-        return "bg-muted text-muted-foreground"
+        return "bg-muted text-muted-foreground";
     }
-  }
+  };
 
   const getValenceLabel = (val: number) => {
-    if (val > 0.3) return "Positive"
-    if (val < -0.3) return "Negative"
-    return "Neutral"
-  }
+    if (val > 0.3) return "Positive";
+    if (val < -0.3) return "Negative";
+    return "Neutral";
+  };
 
   const getArousalLabel = (val: number) => {
-    if (val > 0.5) return "High"
-    if (val < 0.3) return "Low"
-    return "Moderate"
-  }
+    if (val > 0.5) return "High";
+    if (val < 0.3) return "Low";
+    return "Moderate";
+  };
 
   const getDominanceLabel = (val: number) => {
-    if (val > 0.6) return "Dominant"
-    if (val < 0.4) return "Submissive"
-    return "Balanced"
-  }
+    if (val > 0.6) return "Dominant";
+    if (val < 0.4) return "Submissive";
+    return "Balanced";
+  };
+
+  const TrendArrow = ({ trend }: { trend?: "up" | "down" | "flat" }) => {
+    if (!trend || trend === "flat") return null;
+    if (trend === "up")
+      return <TrendingUp className="h-3 w-3 text-emerald-400 inline ml-1" />;
+    return <TrendingDown className="h-3 w-3 text-red-400 inline ml-1" />;
+  };
 
   return (
     <Card className="border-border/50">
@@ -78,19 +111,33 @@ export function AgentStatusCard({ status }: AgentStatusCardProps) {
           <div className="grid grid-cols-4 gap-2 text-xs">
             <div>
               <span className="text-muted-foreground">Feeling</span>
-              <p className="font-medium text-foreground capitalize">{status.affective_state.primaryEmotion}</p>
+              <p className="font-medium text-foreground capitalize">
+                {status.affective_state.primaryEmotion}
+              </p>
             </div>
             <div>
               <span className="text-muted-foreground">Valence</span>
-              <p className="font-medium text-foreground">{getValenceLabel(status.affective_state.valence)} ({status.affective_state.valence.toFixed(2)})</p>
+              <p className="font-medium text-foreground">
+                {getValenceLabel(status.affective_state.valence)} (
+                {status.affective_state.valence.toFixed(2)})
+                <TrendArrow trend={status.affective_state.valenceTrend} />
+              </p>
             </div>
             <div>
               <span className="text-muted-foreground">Arousal</span>
-              <p className="font-medium text-foreground">{getArousalLabel(status.affective_state.arousal)} ({status.affective_state.arousal.toFixed(2)})</p>
+              <p className="font-medium text-foreground">
+                {getArousalLabel(status.affective_state.arousal)} (
+                {status.affective_state.arousal.toFixed(2)})
+                <TrendArrow trend={status.affective_state.arousalTrend} />
+              </p>
             </div>
             <div>
               <span className="text-muted-foreground">Dominance</span>
-              <p className="font-medium text-foreground">{getDominanceLabel(status.affective_state.dominance)} ({status.affective_state.dominance.toFixed(2)})</p>
+              <p className="font-medium text-foreground">
+                {getDominanceLabel(status.affective_state.dominance)} (
+                {status.affective_state.dominance.toFixed(2)})
+                <TrendArrow trend={status.affective_state.dominanceTrend} />
+              </p>
             </div>
           </div>
         </div>
@@ -102,13 +149,43 @@ export function AgentStatusCard({ status }: AgentStatusCardProps) {
               <Zap className="h-4 w-4 text-primary" />
               <span className="text-sm text-muted-foreground">Energy</span>
             </div>
-            <span className="text-sm font-medium text-foreground">
-              {status.current_energy} / {status.max_energy}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-foreground">
+                {status.current_energy} / {status.max_energy}
+              </span>
+              {energyBreakdown && energyBreakdown.heartbeatNumber > 0 && (
+                <span className="text-xs text-muted-foreground">
+                  (HB#{energyBreakdown.heartbeatNumber}:{" "}
+                  {energyBreakdown.energyStart}→{energyBreakdown.energyEnd})
+                </span>
+              )}
+            </div>
           </div>
           <div className="h-2 w-full overflow-hidden rounded-full bg-secondary">
-            <div className="h-full bg-primary transition-all duration-500" style={{ width: `${energyPercent}%` }} />
+            <div
+              className="h-full bg-primary transition-all duration-500"
+              style={{ width: `${energyPercent}%` }}
+            />
           </div>
+          {energyBreakdown && energyBreakdown.heartbeatNumber > 0 && (
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>
+                −{energyBreakdown.totalCost} spent
+                {energyBreakdown.actionCosts.length > 0 && (
+                  <span className="text-[10px] ml-1">
+                    (
+                    {energyBreakdown.actionCosts
+                      .map((a) => `${a.action}:${a.cost}`)
+                      .join(", ")}
+                    )
+                  </span>
+                )}
+              </span>
+              <span className="text-emerald-400">
+                +{energyBreakdown.recharge} recharge
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Quick Stats */}
@@ -116,25 +193,37 @@ export function AgentStatusCard({ status }: AgentStatusCardProps) {
           <div className="space-y-1">
             <div className="flex items-center gap-2">
               <Activity className="h-4 w-4 text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">Last Heartbeat</span>
+              <span className="text-xs text-muted-foreground">
+                Last Heartbeat
+              </span>
             </div>
-            <p className="text-sm font-medium text-foreground">{timeSinceHeartbeatMinutes}m ago</p>
+            <p className="text-sm font-medium text-foreground">
+              {timeSinceHeartbeatMinutes}m ago
+            </p>
           </div>
 
           <div className="space-y-1">
             <div className="flex items-center gap-2">
               <Target className="h-4 w-4 text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">Active Goals</span>
+              <span className="text-xs text-muted-foreground">
+                Active Goals
+              </span>
             </div>
-            <p className="text-sm font-medium text-foreground">{status.active_goals}</p>
+            <p className="text-sm font-medium text-foreground">
+              {status.active_goals}
+            </p>
           </div>
 
           <div className="space-y-1">
             <div className="flex items-center gap-2">
               <Brain className="h-4 w-4 text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">Total Memories</span>
+              <span className="text-xs text-muted-foreground">
+                Total Memories
+              </span>
             </div>
-            <p className="text-sm font-medium text-foreground">{status.total_memories.toLocaleString()}</p>
+            <p className="text-sm font-medium text-foreground">
+              {status.total_memories.toLocaleString()}
+            </p>
           </div>
 
           <div className="space-y-1">
@@ -142,11 +231,15 @@ export function AgentStatusCard({ status }: AgentStatusCardProps) {
               <Sparkles className="h-4 w-4 text-muted-foreground" />
               <span className="text-xs text-muted-foreground">LLM Model</span>
             </div>
-            <p className="text-xs font-medium text-foreground truncate" title={status.llm_model}>{status.llm_model}</p>
+            <p
+              className="text-xs font-medium text-foreground truncate"
+              title={status.llm_model}
+            >
+              {status.llm_model}
+            </p>
           </div>
         </div>
       </CardContent>
     </Card>
-  )
+  );
 }
-

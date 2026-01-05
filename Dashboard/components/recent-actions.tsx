@@ -8,7 +8,9 @@ interface ActionEntry {
   timestamp: Date
   action: string
   params?: Record<string, unknown>
-  cost?: number
+  result?: Record<string, unknown>
+  externalOutput?: Record<string, unknown>
+  cost: number
 }
 
 interface RecentActionsProps {
@@ -124,6 +126,120 @@ export function RecentActions({ actions }: RecentActionsProps) {
     }
   }
 
+  // Format the result into a human-readable "→ outcome" line
+  const getActionResult = (action: ActionEntry): string | null => {
+    const result = action.result
+
+    // Check for errors first
+    if (result?.error) {
+      return `⚠ ${String(result.error).slice(0, 80)}`
+    }
+
+    // Navigate the nested structure: result -> result -> external_call_result -> result
+    const innerResult = (result?.result as Record<string, unknown>) || {}
+    const externalCallResult = (innerResult?.external_call_result as Record<string, unknown>) || {}
+    const llmResult = (externalCallResult?.result as Record<string, unknown>) || {}
+
+    // For reflect actions, extract insights from the deeply nested LLM response
+    if (action.action === 'reflect') {
+      const insights = llmResult.insights as Array<{ content?: string }> | undefined
+      if (insights && insights.length > 0 && insights[0]?.content) {
+        const text = insights[0].content.slice(0, 100)
+        return `${text}${insights[0].content.length > 100 ? '...' : ''}`
+      }
+      // Check for self_updates or worldview_updates as fallback
+      const selfUpdates = llmResult.self_updates as Array<{ content?: string }> | undefined
+      if (selfUpdates && selfUpdates.length > 0 && selfUpdates[0]?.content) {
+        const text = selfUpdates[0].content.slice(0, 80)
+        return `Self-update: ${text}${selfUpdates[0].content.length > 80 ? '...' : ''}`
+      }
+    }
+
+    // For inquire actions, check for answer in the nested structure
+    if (action.action === 'inquire_shallow' || action.action === 'inquire_deep') {
+      const answer = llmResult.answer || llmResult.response || externalCallResult.answer
+      if (answer && typeof answer === 'string') {
+        const text = answer.slice(0, 100)
+        return `${text}${answer.length > 100 ? '...' : ''}`
+      }
+    }
+
+    // For synthesize, check for created memory content
+    if (action.action === 'synthesize') {
+      const content = llmResult.content || llmResult.synthesis
+      if (content && typeof content === 'string') {
+        const text = content.slice(0, 80)
+        return `Created: "${text}${content.length > 80 ? '...' : ''}"`
+      }
+    }
+
+    // For brainstorm_goals, check for generated goals
+    if (action.action === 'brainstorm_goals') {
+      const goals = llmResult.goals as Array<unknown> | undefined
+      if (goals && goals.length > 0) {
+        return `Generated ${goals.length} goal${goals.length > 1 ? 's' : ''}`
+      }
+    }
+
+    // Fall back to basic result parsing
+    if (!result) return null
+
+    switch (action.action) {
+      case 'recall':
+        // Check the nested structure first (innerResult is already declared above)
+        if (innerResult.memory_count !== undefined) {
+          return `Retrieved ${innerResult.memory_count} relevant memories`
+        }
+        if (innerResult.memories && Array.isArray(innerResult.memories)) {
+          return `Retrieved ${innerResult.memories.length} relevant memories`
+        }
+        if (result.memory_count !== undefined) {
+          return `Retrieved ${result.memory_count} relevant memories`
+        }
+        if (result.memories && Array.isArray(result.memories)) {
+          return `Retrieved ${result.memories.length} relevant memories`
+        }
+        return result.queued ? 'Processing memory query...' : null
+      case 'reflect':
+        return result.queued ? 'Processing reflection...' : null
+      case 'synthesize':
+        if (result.synthesis_memory_id) {
+          return 'Created semantic memory'
+        }
+        return result.queued ? 'Processing synthesis...' : null
+      case 'connect':
+        if (result.connected) {
+          return `Linked memories via ${action.params?.relationship_type || 'relationship'}`
+        }
+        return null
+      case 'reprioritize':
+        if (result.reprioritized) {
+          return 'Goal priority updated'
+        }
+        return null
+      case 'reach_out_user':
+        if (result.queued || result.success) {
+          return 'Message queued for user'
+        }
+        return null
+      case 'inquire_shallow':
+      case 'inquire_deep':
+        return result.queued ? 'Query processing...' : null
+      case 'rest':
+        return 'Energy conserved'
+      case 'maintain':
+        return result.success ? 'Maintenance cycle completed' : null
+      default:
+        if (result.success === true) {
+          return 'Completed'
+        }
+        if (result.success === false) {
+          return 'Action failed'
+        }
+        return null
+    }
+  }
+
   return (
     <Card className="border-border/50">
       <CardHeader>
@@ -160,15 +276,18 @@ export function RecentActions({ actions }: RecentActionsProps) {
                       <span className="text-xs text-muted-foreground">
                         #{entry.heartbeatNumber}
                       </span>
-                      {entry.cost && (
-                        <span className="text-xs text-muted-foreground">
-                          -{entry.cost}⚡
-                        </span>
-                      )}
+                      <span className="text-xs text-muted-foreground">
+                        (Cost = {entry.cost})
+                      </span>
                     </div>
                     <p className="text-xs text-foreground/70 truncate">
                       {getActionSummary(entry)}
                     </p>
+                    {getActionResult(entry) && (
+                      <p className="text-xs text-emerald-400/80 truncate">
+                        → {getActionResult(entry)}
+                      </p>
+                    )}
                   </div>
                   <span className="text-[10px] text-muted-foreground whitespace-nowrap">
                     {formatTime(entry.timestamp)}
