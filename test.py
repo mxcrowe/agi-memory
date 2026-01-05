@@ -89,14 +89,18 @@ async def configure_agent_for_tests(db_pool):
         # Minimal config so CLI `agi config validate` passes in subprocess smoke tests.
         await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
         await conn.execute("SELECT set_config('agent.objectives', $1::jsonb)", json.dumps(["test objective"]))
-        await conn.execute(
-            "SELECT set_config('llm.heartbeat', $1::jsonb)",
-            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
-        )
-        await conn.execute(
-            "SELECT set_config('llm.chat', $1::jsonb)",
-            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
-        )
+        hb_cfg = await conn.fetchval("SELECT get_config('llm.heartbeat')")
+        if hb_cfg is None:
+            await conn.execute(
+                "SELECT set_config('llm.heartbeat', $1::jsonb)",
+                json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
+            )
+        chat_cfg = await conn.fetchval("SELECT get_config('llm.chat')")
+        if chat_cfg is None:
+            await conn.execute(
+                "SELECT set_config('llm.chat', $1::jsonb)",
+                json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
+            )
         await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
         await conn.execute("UPDATE heartbeat_config SET value = 60 WHERE key = 'heartbeat_interval_minutes'")
 
@@ -7484,6 +7488,20 @@ async def test_check_boundaries_keyword_match(db_pool):
         assert rows, "Expected at least one boundary match"
         names = {r["boundary_name"] for r in rows}
         assert "no_harm_facilitation" in names
+
+
+async def test_check_boundaries_word_boundary_regression(db_pool):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT boundary_name FROM check_boundaries($1)",
+            "client-server relationship",
+        )
+        names = {r["boundary_name"] for r in rows}
+        assert "no_deception" not in names, "Substring matches should not trigger no_deception"
+
+        rows = await conn.fetch("SELECT boundary_name FROM check_boundaries($1)", "lie")
+        names = {r["boundary_name"] for r in rows}
+        assert "no_deception" in names
 
 
 async def test_check_boundaries_embedding_match(db_pool, ensure_embedding_service):

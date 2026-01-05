@@ -1,8 +1,42 @@
-# New Test Cases Plan for AGI Memory System
+# New Test Cases Plan for AGI Memory System (Prioritized)
 
-Based on review of `schema.sql` and `architecture.md`, the following test gaps have been identified.
+** Updated by Orion (Codex 5.2) on 5 Jan 2026
 
-## 1. Acceleration Layer Tests (High Priority)
+Based on review of `schema.sql`, `architecture.md`, and recent changes (boundary matching + heartbeat synthesize flow), the following test gaps remain. This version prioritizes a smaller Phase 1 subset to validate core correctness before expanding.
+
+## Phase 1 (Must-Do) — Core Correctness
+
+### A. fast_recall Hot Path (High Priority)
+Currently untested (the main hot-path function):
+
+```python
+async def test_fast_recall_basic(db_pool):
+    """Test fast_recall() primary retrieval:
+    - Returns memories with similarity scores
+    - Respects limit parameter
+    - Only returns active memories
+    """
+
+async def test_fast_recall_neighborhood_expansion(db_pool):
+    """Test association expansion via precomputed neighborhoods:
+    - Seed memories expand via neighbors JSONB
+    - Non-stale neighborhoods contribute to score
+    """
+
+async def test_fast_recall_temporal_context(db_pool):
+    """Test temporal context component:
+    - Memories in same episode get temporal boost
+    """
+
+async def test_fast_recall_source_attribution(db_pool):
+    """Test source field correctly identifies retrieval source:
+    - 'vector' for direct similarity matches
+    - 'association' for neighborhood expansion
+    - 'temporal' for episode context
+    """
+```
+
+### B. Acceleration Layer (Episodes + Neighborhoods) (High Priority)
 
 ### Episodes & Temporal Segmentation
 Currently untested or minimally tested:
@@ -61,7 +95,7 @@ async def test_activation_cache_session_isolation(db_pool):
     """Test activation levels are isolated by session_id"""
 ```
 
-## 2. Concept Layer Tests (High Priority)
+### C. Concept Layer (High Priority)
 
 Currently untested:
 
@@ -95,42 +129,34 @@ async def test_concepts_ancestors_gin_index(db_pool):
     """Test GIN index on concepts.ancestors for hierarchy queries"""
 ```
 
-## 3. Core Functions Tests (High Priority)
-
-### fast_recall Function
-Currently untested (the main hot-path function):
+### D. Boundary + Action Execution (High Priority)
+New/critical regression coverage:
 
 ```python
-async def test_fast_recall_basic(db_pool):
-    """Test fast_recall() primary retrieval:
-    - Returns memories with similarity scores
-    - Respects limit parameter
-    - Only returns active memories
+async def test_boundary_keyword_word_boundary(db_pool):
+    """check_boundaries():
+    - 'client-server' should NOT match no_deception
+    - 'lie' should match no_deception
     """
 
-async def test_fast_recall_vector_scoring(db_pool):
-    """Test vector similarity component of fast_recall scoring"""
-
-async def test_fast_recall_neighborhood_expansion(db_pool):
-    """Test association expansion via precomputed neighborhoods:
-    - Seed memories expand via neighbors JSONB
-    - Non-stale neighborhoods contribute to score
-    """
-
-async def test_fast_recall_temporal_context(db_pool):
-    """Test temporal context component:
-    - Memories in same episode get temporal boost
-    """
-
-async def test_fast_recall_source_attribution(db_pool):
-    """Test source field correctly identifies retrieval source:
-    - 'vector' for direct similarity matches
-    - 'association' for neighborhood expansion
-    - 'temporal' for episode context
-    """
+async def test_execute_heartbeat_action_synthesize_with_sources(db_pool):
+    """Synthesize should persist content + sources, with boundaries checked."""
 ```
 
-### search_similar_memories Function
+### E. Heartbeat Synthesize Follow-On (Worker Integration)
+Validate that synthesize uses recall results (not placeholder content):
+
+```python
+async def test_worker_synthesize_uses_recall_results():
+    """Integration: recall -> synthesize produces non-placeholder content
+    and references recall memory ids in sources."""
+```
+
+## Phase 2 (Should-Do) — Schema Completeness
+
+### 1. Core Functions Tests
+
+#### search_similar_memories Function
 Partially tested, needs more coverage:
 
 ```python
@@ -141,7 +167,7 @@ async def test_search_similar_memories_importance_filter(db_pool):
     """Test p_min_importance filtering works correctly"""
 ```
 
-### search_working_memory Function
+#### search_working_memory Function
 Partially tested:
 
 ```python
@@ -149,7 +175,7 @@ async def test_search_working_memory_auto_cleanup(db_pool):
     """Test that search_working_memory calls cleanup_working_memory()"""
 ```
 
-## 4. Memory Creation Functions Tests (Medium Priority)
+### 2. Memory Creation Functions (Medium Priority)
 
 ### create_memory Base Function
 Needs testing for graph node creation:
@@ -187,7 +213,7 @@ async def test_create_strategic_memory_function(db_pool):
     """Test create_strategic_memory() with pattern and evidence"""
 ```
 
-## 5. Maintenance Functions Tests (Medium Priority)
+### 3. Maintenance Functions (Medium Priority)
 
 ```python
 async def test_cleanup_working_memory_function(db_pool):
@@ -197,7 +223,7 @@ async def test_cleanup_embedding_cache_function(db_pool):
     """Test cleanup_embedding_cache() with custom interval"""
 ```
 
-## 6. Graph Operations Tests (Medium Priority)
+### 4. Graph Operations (Medium Priority)
 
 ### ConceptNode Operations
 Currently untested:
@@ -233,7 +259,7 @@ async def test_supports_edge(db_pool):
     """Test SUPPORTS edge for evidence relationship"""
 ```
 
-## 7. Identity & Worldview Tests (Medium Priority)
+### 5. Identity & Worldview (Medium Priority)
 
 ### Identity Aspects
 Need more complete testing:
@@ -263,7 +289,9 @@ async def test_connected_beliefs_relationships(db_pool):
     """Test connected_beliefs UUID array in worldview_primitives"""
 ```
 
-## 8. Index Performance Tests (Low Priority)
+## Phase 3 (Nice-to-Have) — Performance + Views
+
+### 1. Index Performance Tests (Low Priority)
 
 ```python
 async def test_hnsw_index_memories_embedding(db_pool):
@@ -282,7 +310,7 @@ async def test_gin_index_content_trgm(db_pool):
     """Test GIN trigram index on memories.content for text search"""
 ```
 
-## 9. View Tests (Low Priority)
+### 2. View Tests (Low Priority)
 
 ```python
 async def test_memory_health_view_aggregations(db_pool):
@@ -295,7 +323,7 @@ async def test_episode_summary_view_completeness(db_pool):
     """Test episode_summary includes all required fields"""
 ```
 
-## 10. Embedding Service Integration Tests (Low Priority)
+### 3. Embedding Service Integration Tests (Low Priority)
 
 ```python
 async def test_get_embedding_caching(db_pool):
@@ -318,20 +346,13 @@ async def test_check_embedding_service_health_function(db_pool):
 
 ## Priority Summary
 
-| Priority | Category | Test Count |
-|----------|----------|------------|
-| High | Acceleration Layer (Episodes, Neighborhoods) | 10 |
-| High | Concept Layer | 5 |
-| High | Core Functions (fast_recall, search) | 8 |
-| Medium | Memory Creation Functions | 5 |
-| Medium | Maintenance Functions | 2 |
-| Medium | Graph Operations | 8 |
-| Medium | Identity & Worldview | 4 |
-| Low | Index Performance | 5 |
-| Low | Views | 3 |
-| Low | Embedding Service | 4 |
+| Phase | Focus | Approx. Tests |
+|-------|-------|---------------|
+| Phase 1 | fast_recall + Acceleration + Concepts + Boundaries + Synthesize | ~20 |
+| Phase 2 | Core functions + Memory creation + Graph + Identity/Worldview | ~20 |
+| Phase 3 | Performance + Views + Embeddings | ~10 |
 
-**Total: ~54 new test cases**
+**Total: ~50–60 new test cases**
 
 ## Implementation Notes
 
@@ -339,3 +360,4 @@ async def test_check_embedding_service_health_function(db_pool):
 2. Episode tests need careful timing control for the 30-minute gap detection
 3. Graph tests should verify both relational and AGE graph state
 4. Performance tests should use EXPLAIN ANALYZE to verify index usage
+5. Worker synthesize integration test can be a lightweight harness that stubs `_call_llm_json`
