@@ -11,7 +11,8 @@ import { SemanticDensityMap } from "@/components/semantic-density-map";
 import { InsightProgressBar } from "@/components/insight-progress-bar";
 import { MemoryDepthChart } from "@/components/memory-depth-chart";
 import { DriveStatus } from "@/components/drive-status";
-import { Brain, Mail } from "lucide-react";
+import { MailIndicator } from "@/components/mail-indicator";
+import { Brain } from "lucide-react";
 import Link from "next/link";
 import {
   getAgentStatus,
@@ -242,21 +243,8 @@ export default async function DashboardPage() {
           </h2>
           <div className="flex items-center justify-between">
             <PulseIndicator status={vitality.pulse_status} />
-            {/* Mail indicator */}
-            <div className="flex items-center justify-center">
-              <Mail
-                className={`h-5 w-5 ${
-                  heartbeatState.unreadMessages > 0
-                    ? "text-red-400 animate-pulse"
-                    : "text-muted-foreground"
-                }`}
-              />
-              {heartbeatState.unreadMessages > 0 && (
-                <span className="ml-1 text-xs font-bold text-red-400">
-                  {heartbeatState.unreadMessages}
-                </span>
-              )}
-            </div>
+            {/* Mail indicator - clickable to acknowledge */}
+            <MailIndicator initialUnseenCount={heartbeatState.unreadMessages} />
             <div className="text-right">
               <div className="text-2xl font-mono font-bold text-foreground">
                 #{vitality.heartbeat_index}

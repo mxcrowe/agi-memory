@@ -1,13 +1,14 @@
-import { MemoryTimeline } from "@/components/memory-timeline"
-import { SemanticMemories } from "@/components/semantic-memories"
-import { IdentityPanel } from "@/components/identity-panel"
-import { WorldviewGrid } from "@/components/worldview-grid"
-import { KnowledgeGraph3D } from "@/components/knowledge-graph-3d"
-import { SemanticDensityMap } from "@/components/semantic-density-map"
-import { InsightProgressBar } from "@/components/insight-progress-bar"
-import { MemoryDepthChart } from "@/components/memory-depth-chart"
-import { Brain } from "lucide-react"
-import Link from "next/link"
+import { MemoryTimeline } from "@/components/memory-timeline";
+import { SemanticMemories } from "@/components/semantic-memories";
+import { IdentityPanel } from "@/components/identity-panel";
+import { WorldviewGrid } from "@/components/worldview-grid";
+import { KnowledgeGraph3D } from "@/components/knowledge-graph-3d";
+import { SemanticDensityMap } from "@/components/semantic-density-map";
+import { InsightProgressBar } from "@/components/insight-progress-bar";
+import { MemoryDepthChart } from "@/components/memory-depth-chart";
+import { Brain } from "lucide-react";
+import Link from "next/link";
+import { getAgentStatus } from "@/lib/db-queries";
 import {
   mockEpisodicMemories,
   mockSemanticMemories,
@@ -16,17 +17,31 @@ import {
   mockKnowledgeGraph,
   mockMemoryDynamics,
   mockInsightProgress,
-  mockMemoryDistribution,
-} from "@/lib/mock-data"
+} from "@/lib/mock-data";
 
 export default async function MemoryPage() {
-  const episodicMemories = mockEpisodicMemories
-  const semanticMemories = mockSemanticMemories
+  // Fetch real memory stats
+  const status = await getAgentStatus();
+  const memoryDistribution = [
+    { type: "Episodic", count: status.episodicCount, color: "bg-purple-500" },
+    { type: "Semantic", count: status.semanticCount, color: "bg-cyan-500" },
+    {
+      type: "Procedural",
+      count: status.proceduralCount,
+      color: "bg-emerald-500",
+    },
+    { type: "Strategic", count: status.strategicCount, color: "bg-blue-500" },
+  ];
+  const totalMemories = status.totalMemories;
+  const inactiveMemories = status.inactiveMemories;
+
+  const episodicMemories = mockEpisodicMemories;
+  const semanticMemories = mockSemanticMemories;
   const identity = {
     aspects: mockIdentityAspects,
     worldview: mockWorldviewBeliefs,
-  }
-  const knowledgeGraph = mockKnowledgeGraph
+  };
+  const knowledgeGraph = mockKnowledgeGraph;
 
   return (
     <div className="min-h-screen bg-background">
@@ -38,19 +53,32 @@ export default async function MemoryPage() {
               <Brain className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold text-foreground">Hexis Dashboard</h1>
+              <h1 className="text-xl font-semibold text-foreground">
+                Hexis Dashboard
+              </h1>
               <p className="text-sm text-muted-foreground">Memory Explorer</p>
             </div>
           </Link>
           <nav className="flex items-center gap-4">
-            <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
+            <Link
+              href="/"
+              className="text-sm text-muted-foreground hover:text-foreground"
+            >
               Status
             </Link>
-            <button className="text-sm font-medium text-foreground hover:text-primary">Memory</button>
-            <Link href="/chat" className="text-sm text-muted-foreground hover:text-foreground">
+            <button className="text-sm font-medium text-foreground hover:text-primary">
+              Memory
+            </button>
+            <Link
+              href="/chat"
+              className="text-sm text-muted-foreground hover:text-foreground"
+            >
               Chat
             </Link>
-            <Link href="/config" className="text-sm text-muted-foreground hover:text-foreground">
+            <Link
+              href="/config"
+              className="text-sm text-muted-foreground hover:text-foreground"
+            >
               Config
             </Link>
           </nav>
@@ -59,18 +87,21 @@ export default async function MemoryPage() {
 
       {/* Main Content */}
       <main className="container mx-auto px-6 py-6 space-y-6">
-        <section>
-          <h2 className="text-lg font-semibold text-foreground mb-4">Relationship Graphing</h2>
-          <KnowledgeGraph3D graph={knowledgeGraph} />
-        </section>
-
         <section className="space-y-4">
-          <h2 className="text-lg font-semibold text-foreground">Memory Dynamics</h2>
+          <h2 className="text-lg font-semibold text-foreground">
+            Memory Dynamics
+          </h2>
           <div className="grid gap-4 md:grid-cols-2">
-            <SemanticDensityMap clusters={mockMemoryDynamics.semantic_density} />
+            <SemanticDensityMap
+              clusters={mockMemoryDynamics.semantic_density}
+            />
             <div className="space-y-4">
               <InsightProgressBar progress={mockInsightProgress} />
-              <MemoryDepthChart data={mockMemoryDistribution} />
+              <MemoryDepthChart
+                data={memoryDistribution}
+                totalMemories={totalMemories}
+                inactiveMemories={inactiveMemories}
+              />
             </div>
           </div>
         </section>
@@ -88,7 +119,15 @@ export default async function MemoryPage() {
             <SemanticMemories memories={semanticMemories} />
           </div>
         </div>
+
+        {/* Knowledge Graph - TODO: wire to real data */}
+        <section>
+          <h2 className="text-lg font-semibold text-foreground mb-4">
+            Relationship Graphing
+          </h2>
+          <KnowledgeGraph3D graph={knowledgeGraph} />
+        </section>
       </main>
     </div>
-  )
+  );
 }

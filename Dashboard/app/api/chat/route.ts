@@ -1,28 +1,29 @@
-import { sql } from "@/lib/db"
-import { NextResponse } from "next/server"
+import { sql } from "@/lib/db";
+import { NextResponse } from "next/server";
 
 // POST /api/chat - Handle user response to outbox message
 export async function POST(request: Request) {
   try {
-    const body = await request.json()
-    const { message, inReplyTo, tone } = body
+    const body = await request.json();
+    const { message, inReplyTo, tone } = body;
 
     if (!message?.trim()) {
       return NextResponse.json(
         { success: false, error: "Message is required" },
         { status: 400 }
-      )
+      );
     }
 
     // Map tone to valence/importance
-    const toneValues: Record<string, { valence: number; importance: number }> = {
-      casual: { valence: 0.3, importance: 0.6 },
-      normal: { valence: 0.5, importance: 0.8 },
-      warm: { valence: 0.7, importance: 0.85 },
-      urgent: { valence: 0.5, importance: 0.95 },
-    }
+    const toneValues: Record<string, { valence: number; importance: number }> =
+      {
+        casual: { valence: 0.3, importance: 0.6 },
+        normal: { valence: 0.5, importance: 0.8 },
+        warm: { valence: 0.7, importance: 0.85 },
+        urgent: { valence: 0.5, importance: 0.95 },
+      };
 
-    const { valence, importance } = toneValues[tone] || toneValues.normal
+    const { valence, importance } = toneValues[tone] || toneValues.normal;
 
     // Insert into inbox_messages
     const result = await sql`
@@ -40,29 +41,39 @@ export async function POST(request: Request) {
         ${importance}
       )
       RETURNING id
-    `
+    `;
 
-    const inboxId = result[0]?.id
+    const inboxId = result[0]?.id;
 
-    // Process immediately to create the episodic memory
-    const memoryResult = await sql`
-      SELECT process_inbox_message(${inboxId}) as memory_id
-    `
-
-    const memoryId = memoryResult[0]?.memory_id
+    // Process immediately to create the episodic memory (function is in ag_catalog schema)
+    let memoryId = null;
+    try {
+      const memoryResult = await sql`
+        SELECT ag_catalog.process_inbox_message(${inboxId}::uuid) as memory_id
+      `;
+      memoryId = memoryResult[0]?.memory_id;
+    } catch (memoryError) {
+      // Message was saved even if memory creation failed
+      console.warn(
+        "Memory creation failed, but message was saved:",
+        memoryError
+      );
+    }
 
     return NextResponse.json({
       success: true,
       inboxId,
       memoryId,
-      message: "Response recorded and memory created",
-    })
+      message: memoryId
+        ? "Response recorded and memory created"
+        : "Response recorded (memory creation pending)",
+    });
   } catch (error) {
-    console.error("Error processing chat message:", error)
+    console.error("Error processing chat message:", error);
     return NextResponse.json(
       { success: false, error: "Failed to process message" },
       { status: 500 }
-    )
+    );
   }
 }
 
@@ -84,14 +95,14 @@ export async function GET() {
       LEFT JOIN outbox_messages o ON i.in_reply_to = o.id
       ORDER BY i.created_at DESC
       LIMIT 20
-    `
+    `;
 
-    return NextResponse.json({ success: true, messages })
+    return NextResponse.json({ success: true, messages });
   } catch (error) {
-    console.error("Error fetching inbox:", error)
+    console.error("Error fetching inbox:", error);
     return NextResponse.json(
       { success: false, error: "Failed to fetch inbox messages" },
       { status: 500 }
-    )
+    );
   }
 }

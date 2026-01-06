@@ -12,7 +12,9 @@ import type {
 export async function getAgentStatus() {
   const [memoryStats] = await sql`
     SELECT
+      COUNT(*) as total_memories,
       COUNT(*) FILTER (WHERE status = 'active') as active_memories,
+      COUNT(*) FILTER (WHERE status != 'active') as inactive_memories,
       COUNT(*) FILTER (WHERE type = 'episodic') as episodic_count,
       COUNT(*) FILTER (WHERE type = 'semantic') as semantic_count,
       COUNT(*) FILTER (WHERE type = 'procedural') as procedural_count,
@@ -35,7 +37,9 @@ export async function getAgentStatus() {
   `;
 
   return {
-    totalMemories: Number.parseInt(memoryStats.active_memories || "0"),
+    totalMemories: Number.parseInt(memoryStats.total_memories || "0"),
+    activeMemories: Number.parseInt(memoryStats.active_memories || "0"),
+    inactiveMemories: Number.parseInt(memoryStats.inactive_memories || "0"),
     episodicCount: Number.parseInt(memoryStats.episodic_count || "0"),
     semanticCount: Number.parseInt(memoryStats.semantic_count || "0"),
     proceduralCount: Number.parseInt(memoryStats.procedural_count || "0"),
@@ -95,9 +99,9 @@ export async function getHeartbeatState() {
   const arousalTrend: "up" | "down" | "flat" = "flat";
   const dominanceTrend: "up" | "down" | "flat" = "flat";
 
-  // Get unread message count from outbox (pending = not yet sent = unread by user)
+  // Get unseen message count from outbox (sent but not yet acknowledged by user)
   const [unreadCount] = await sql`
-    SELECT COUNT(*) as count FROM outbox_messages WHERE status = 'pending'
+    SELECT COUNT(*) as count FROM outbox_messages WHERE status = 'sent' AND seen_at IS NULL
   `;
 
   return {
@@ -647,4 +651,59 @@ export async function getVitalityMetrics() {
     workingMemoryCount: Number.parseInt(workingMemory.count || "0"),
     lastActivity: stats.last_created,
   };
+}
+
+// Get chat history (both outbox and inbox messages)
+export async function getChatHistory(limit = 50) {
+  // Outbox = Hexis → User
+  const outbox = await sql`
+    SELECT
+      id::text,
+      created_at,
+      'outgoing' as direction,
+      payload->>'message' as message,
+      payload->>'intent' as intent,
+      status
+    FROM outbox_messages
+    ORDER BY created_at DESC
+    LIMIT ${limit}
+  `;
+
+  // Inbox = User → Hexis
+  const inbox = await sql`
+    SELECT
+      id::text,
+      created_at,
+      'incoming' as direction,
+      message,
+      from_user,
+      processed
+    FROM ag_catalog.inbox_messages
+    ORDER BY created_at DESC
+    LIMIT ${limit}
+  `;
+
+  // Combine and sort by date
+  const combined = [
+    ...outbox.map((m) => ({
+      id: m.id as string,
+      createdAt: m.created_at as Date,
+      direction: "outgoing" as const,
+      message: m.message as string,
+      sender: "Hexis",
+      status: m.status as string,
+    })),
+    ...inbox.map((m) => ({
+      id: m.id as string,
+      createdAt: m.created_at as Date,
+      direction: "incoming" as const,
+      message: m.message as string,
+      sender: (m.from_user as string) || "User",
+      status: m.processed ? "processed" : "pending",
+    })),
+  ].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+
+  return combined.slice(0, limit);
 }
