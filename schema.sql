@@ -3046,29 +3046,22 @@ CREATE OR REPLACE FUNCTION should_run_heartbeat()
 RETURNS BOOLEAN AS $$
 DECLARE
     state_record RECORD;
-    interval_minutes FLOAT;
 BEGIN
     -- Don't run until initial configuration is complete.
     IF NOT is_agent_configured() THEN
         RETURN FALSE;
     END IF;
-
     SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
-
     -- Don't run if paused
     IF state_record.is_paused THEN
         RETURN FALSE;
     END IF;
-
-    -- First heartbeat ever
-    IF state_record.last_heartbeat_at IS NULL THEN
+    -- First heartbeat ever (next_heartbeat_at not set yet)
+    IF state_record.next_heartbeat_at IS NULL THEN
         RETURN TRUE;
     END IF;
-
-    -- Check interval
-    SELECT value INTO interval_minutes FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes';
-
-    RETURN CURRENT_TIMESTAMP >= state_record.last_heartbeat_at + (interval_minutes || ' minutes')::INTERVAL;
+    -- Use the scheduled next_heartbeat_at directly (single source of truth)
+    RETURN CURRENT_TIMESTAMP >= state_record.next_heartbeat_at;
 END;
 $$ LANGUAGE plpgsql;
 
