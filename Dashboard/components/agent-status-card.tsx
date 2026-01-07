@@ -17,11 +17,11 @@ import {
 interface AffectiveState {
   valence: number;
   arousal: number;
-  dominance: number;
+  intensity: number;
   primaryEmotion: string;
   valenceTrend?: "up" | "down" | "flat";
   arousalTrend?: "up" | "down" | "flat";
-  dominanceTrend?: "up" | "down" | "flat";
+  intensityTrend?: "up" | "down" | "flat";
 }
 
 interface AgentStatusCardProps {
@@ -82,10 +82,10 @@ export function AgentStatusCard({
     return "Moderate";
   };
 
-  const getDominanceLabel = (val: number) => {
-    if (val > 0.6) return "Dominant";
-    if (val < 0.4) return "Submissive";
-    return "Balanced";
+  const getIntensityLabel = (val: number) => {
+    if (val > 0.6) return "High";
+    if (val < 0.3) return "Low";
+    return "Moderate";
   };
 
   const TrendArrow = ({ trend }: { trend?: "up" | "down" | "flat" }) => {
@@ -132,11 +132,11 @@ export function AgentStatusCard({
               </p>
             </div>
             <div>
-              <span className="text-muted-foreground">Dominance</span>
+              <span className="text-muted-foreground">Intensity</span>
               <p className="font-medium text-foreground">
-                {getDominanceLabel(status.affective_state.dominance)} (
-                {status.affective_state.dominance.toFixed(2)})
-                <TrendArrow trend={status.affective_state.dominanceTrend} />
+                {getIntensityLabel(status.affective_state.intensity)} (
+                {status.affective_state.intensity.toFixed(2)})
+                <TrendArrow trend={status.affective_state.intensityTrend} />
               </p>
             </div>
           </div>

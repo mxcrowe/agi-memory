@@ -97,7 +97,7 @@ export async function getHeartbeatState() {
   // TODO: Add affective_end column to heartbeat_log via schema update, then enable trends
   const valenceTrend: "up" | "down" | "flat" = "flat";
   const arousalTrend: "up" | "down" | "flat" = "flat";
-  const dominanceTrend: "up" | "down" | "flat" = "flat";
+  const intensityTrend: "up" | "down" | "flat" = "flat";
 
   // Get unseen message count from outbox (sent but not yet acknowledged by user)
   const [unreadCount] = await sql`
@@ -124,11 +124,11 @@ export async function getHeartbeatState() {
     affectiveState: {
       valence: Number.parseFloat(affective.valence || "0"),
       arousal: Number.parseFloat(affective.arousal || "0"),
-      dominance: Number.parseFloat(affective.dominance || "0.5"),
+      intensity: Number.parseFloat(affective.intensity || "0.5"),
       primaryEmotion: affective.primary_emotion || "neutral",
       valenceTrend,
       arousalTrend,
-      dominanceTrend,
+      intensityTrend,
     },
     unreadMessages: Number.parseInt(unreadCount?.count || "0"),
     heartbeats24h: Number.parseInt(hb24h?.count || "0"),
@@ -255,16 +255,15 @@ export async function getMaintenanceState() {
       (SELECT COUNT(*) FROM memories WHERE type = 'semantic' AND status = 'active') as semantic_count
   `;
 
-  // Get latest maintenance log entry (may not exist yet)
-  const [latestLog] = await sql`
+  // Get 24-hour cumulative maintenance stats (shows activity/trends instead of just last run)
+  const [cumulativeStats] = await sql`
     SELECT
-      neighborhoods_recomputed,
-      embedding_cache_deleted,
-      working_memory_deleted,
-      working_memory_promoted
+      COALESCE(SUM(neighborhoods_recomputed), 0) as neighborhoods_24h,
+      COALESCE(SUM(embedding_cache_deleted), 0) as cache_deleted_24h,
+      COALESCE(SUM(working_memory_deleted), 0) as wm_deleted_24h,
+      COALESCE(SUM(working_memory_promoted), 0) as wm_promoted_24h
     FROM maintenance_log
-    ORDER BY ran_at DESC
-    LIMIT 1
+    WHERE ran_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
   `;
 
   // Get pending external calls count
@@ -277,13 +276,13 @@ export async function getMaintenanceState() {
     workingMemoryCount: Number.parseInt(stats?.working_memory_count || "0"),
     longTermCount: Number.parseInt(stats?.long_term_count || "0"),
     semanticCount: Number.parseInt(stats?.semantic_count || "0"),
-    // Latest maintenance stats
+    // 24-hour cumulative maintenance stats
     neighborhoodsRecomputed: Number.parseInt(
-      latestLog?.neighborhoods_recomputed || "0"
+      cumulativeStats?.neighborhoods_24h || "0"
     ),
-    cacheDeleted: Number.parseInt(latestLog?.embedding_cache_deleted || "0"),
-    wmDeleted: Number.parseInt(latestLog?.working_memory_deleted || "0"),
-    wmPromoted: Number.parseInt(latestLog?.working_memory_promoted || "0"),
+    cacheDeleted: Number.parseInt(cumulativeStats?.cache_deleted_24h || "0"),
+    wmDeleted: Number.parseInt(cumulativeStats?.wm_deleted_24h || "0"),
+    wmPromoted: Number.parseInt(cumulativeStats?.wm_promoted_24h || "0"),
     pendingCalls: Number.parseInt(cogHealth?.pending_calls || "0"),
   };
 }

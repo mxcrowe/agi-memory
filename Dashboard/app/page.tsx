@@ -42,6 +42,8 @@ export default async function DashboardPage() {
   // Fetch real data from database
   const status = await fetchWithFallback(getAgentStatus, {
     totalMemories: 0,
+    activeMemories: 0,
+    inactiveMemories: 0,
     episodicCount: 0,
     semanticCount: 0,
     proceduralCount: 0,
@@ -67,11 +69,11 @@ export default async function DashboardPage() {
     affectiveState: {
       valence: 0,
       arousal: 0,
-      dominance: 0.5,
+      intensity: 0.5,
       primaryEmotion: "neutral",
       valenceTrend: "flat" as const,
       arousalTrend: "flat" as const,
-      dominanceTrend: "flat" as const,
+      intensityTrend: "flat" as const,
     },
     unreadMessages: 0,
     heartbeats24h: 0,

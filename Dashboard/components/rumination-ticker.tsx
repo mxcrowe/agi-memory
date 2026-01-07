@@ -170,11 +170,11 @@ export function RuminationTicker({
             </div>
           </div>
 
-          {/* Last Run Stats */}
+          {/* 24hr Activity Stats */}
           <div className="p-2 rounded-lg bg-cyan-500/5 border border-cyan-500/10">
             <div className="flex items-center gap-2 text-xs font-medium text-foreground mb-2">
               <ArrowUpRight className="h-3 w-3 text-cyan-400" />
-              <span>Last Run Stats</span>
+              <span>24hr Activity</span>
             </div>
             <div className="grid grid-cols-4 gap-1 text-xs">
               <div className="text-center p-1 rounded bg-background/50">
@@ -190,13 +190,13 @@ export function RuminationTicker({
                 </p>
               </div>
               <div className="text-center p-1 rounded bg-background/50">
-                <p className="text-muted-foreground text-[9px]">WM Del</p>
+                <p className="text-muted-foreground text-[9px]">Discarded</p>
                 <p className="text-sm font-bold text-foreground">
                   {maintenanceState.wmDeleted ?? 0}
                 </p>
               </div>
               <div className="text-center p-1 rounded bg-background/50">
-                <p className="text-muted-foreground text-[9px]">WM Promo</p>
+                <p className="text-muted-foreground text-[9px]">Promoted</p>
                 <p className="text-sm font-bold text-foreground">
                   {maintenanceState.wmPromoted ?? 0}
                 </p>
