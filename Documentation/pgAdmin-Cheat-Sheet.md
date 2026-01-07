@@ -310,6 +310,13 @@ ORDER BY hb.started_at DESC
 LIMIT 1;
 ```
 
+### Get reasoning text from last [3] heartbeats
+```sql
+SELECT heartbeat_number, LEFT(decision_reasoning, 600) as reasoning
+FROM heartbeat_log
+ORDER BY started_at DESC
+LIMIT 3;
+```
 ---
 
 ## Troubleshooting
@@ -327,7 +334,7 @@ LIMIT 10;
 ```sql
 SELECT id, call_type, status, error_message, requested_at
 FROM external_calls
-WHERE status != 'completed'
+WHERE status != 'completed' {wrong term}
 ORDER BY requested_at DESC;
 ```
 
