@@ -126,6 +126,9 @@ Guidelines:
 - Be purposeful. Don't act just to act.
 - Reaching out to the user is expensive (5 energy). Only do it when meaningful.
 - It's okay to rest and bank energy for later.
+- If any urgent drive shows level >= 1.0 (maxed), you MUST include at least one action that directly satisfies it this heartbeat.
+- For rest: include {"action": "rest", "params": {}}.
+- For competence: complete or reprioritize a goal if possible.
 - Your goals should drive your actions.
 - Notice if you're stuck or scattered.
 - If you have no goals, consider brainstorming some.
@@ -991,10 +994,15 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 continue
             name = d.get("name") or "drive"
             ratio = d.get("urgency_ratio")
+            level = d.get("level")
             if isinstance(ratio, (int, float)):
-                lines.append(f"  - {name}: {ratio:.2f}x threshold")
+                if isinstance(level, (int, float)):
+                    lines.append(
+                        f"  - {name}: {ratio:.2f}x threshold (level {level:.2f})"
+                    )
+                else:
+                    lines.append(f"  - {name}: {ratio:.2f}x threshold")
             else:
-                level = d.get("level")
                 lines.append(
                     f"  - {name}: {level}" if level is not None else f"  - {name}"
                 )
