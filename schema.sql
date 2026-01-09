@@ -1529,6 +1529,11 @@ BEGIN
         CURRENT_TIMESTAMP
     );
 
+    -- Assign memory to clusters when centroids are available.
+    IF EXISTS (SELECT 1 FROM memory_clusters WHERE centroid_embedding IS NOT NULL) THEN
+        PERFORM assign_memory_to_clusters(new_memory_id);
+    END IF;
+
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -1952,6 +1957,107 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Assign memory to clusters based on similarity
+CREATE OR REPLACE FUNCTION refresh_cluster_similarity_threshold(
+    p_sample_size INT DEFAULT NULL,
+    p_percentile FLOAT DEFAULT NULL,
+    p_floor FLOAT DEFAULT 0.2,
+    p_ceiling FLOAT DEFAULT 0.8
+) RETURNS FLOAT AS $$
+DECLARE
+    sample_size INT;
+    percentile FLOAT;
+    threshold FLOAT;
+    zero_vec vector := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM memory_clusters
+        WHERE centroid_embedding IS NOT NULL
+          AND centroid_embedding <> zero_vec
+    ) THEN
+        RETURN COALESCE(
+            (SELECT value FROM cluster_config WHERE key = 'similarity_threshold'),
+            0.7
+        );
+    END IF;
+
+    sample_size := COALESCE(
+        p_sample_size,
+        (SELECT value::int FROM cluster_config WHERE key = 'similarity_sample_size'),
+        200
+    );
+    percentile := COALESCE(
+        p_percentile,
+        (SELECT value FROM cluster_config WHERE key = 'similarity_percentile'),
+        0.6
+    );
+    percentile := LEAST(0.95, GREATEST(0.5, percentile));
+
+    WITH sample AS (
+        SELECT id, embedding
+        FROM memories
+        WHERE status = 'active'
+          AND embedding IS NOT NULL
+          AND embedding <> zero_vec
+        ORDER BY random()
+        LIMIT sample_size
+    ),
+    sims AS (
+        SELECT s.id, MAX(1 - (mc.centroid_embedding <=> s.embedding)) AS best_sim
+        FROM sample s
+        JOIN memory_clusters mc
+          ON mc.centroid_embedding IS NOT NULL
+         AND mc.centroid_embedding <> zero_vec
+        GROUP BY s.id
+    )
+    SELECT percentile_cont(percentile) WITHIN GROUP (ORDER BY best_sim)
+    INTO threshold
+    FROM sims;
+
+    IF threshold IS NULL THEN
+        threshold := COALESCE(
+            (SELECT value FROM cluster_config WHERE key = 'similarity_threshold'),
+            0.7
+        );
+    END IF;
+
+    threshold := LEAST(p_ceiling, GREATEST(p_floor, threshold));
+
+    UPDATE cluster_config
+    SET value = threshold,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE key = 'similarity_threshold';
+
+    RETURN threshold;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_cluster_similarity_threshold(
+    p_max_age INTERVAL DEFAULT '1 day'
+) RETURNS FLOAT AS $$
+DECLARE
+    threshold FLOAT;
+    v_updated_at TIMESTAMPTZ;
+    max_age INTERVAL;
+BEGIN
+    SELECT value, updated_at INTO threshold, v_updated_at
+    FROM cluster_config
+    WHERE key = 'similarity_threshold';
+
+    max_age := COALESCE(
+        (SELECT (value || ' hours')::interval FROM cluster_config WHERE key = 'similarity_max_age_hours'),
+        p_max_age
+    );
+
+    IF threshold IS NULL OR v_updated_at IS NULL OR v_updated_at < CURRENT_TIMESTAMP - max_age THEN
+        threshold := refresh_cluster_similarity_threshold(NULL, NULL);
+    END IF;
+
+    RETURN COALESCE(threshold, 0.7);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Assign memory to clusters based on similarity
 CREATE OR REPLACE FUNCTION assign_memory_to_clusters(
     p_memory_id UUID,
     p_max_clusters INT DEFAULT 3
@@ -1959,7 +2065,7 @@ CREATE OR REPLACE FUNCTION assign_memory_to_clusters(
 DECLARE
     memory_embedding vector;
     cluster_record RECORD;
-    similarity_threshold FLOAT := 0.7;
+    similarity_threshold FLOAT := get_cluster_similarity_threshold();
     assigned_count INT := 0;
     zero_vec vector := array_fill(0, ARRAY[embedding_dimension()])::vector;
 BEGIN
@@ -2578,6 +2684,26 @@ INSERT INTO maintenance_config (key, value, description) VALUES
     ('embedding_cache_older_than_days', 7, 'Days before embedding_cache entries are eligible for cleanup'),
     ('working_memory_promote_min_importance', 0.75, 'Working-memory items above this importance are promoted on expiry'),
     ('working_memory_promote_min_accesses', 3, 'Working-memory items accessed >= this count are promoted on expiry');
+
+-- ============================================================================
+-- CLUSTERING CONFIGURATION
+-- ============================================================================
+
+CREATE TABLE cluster_config (
+    key TEXT PRIMARY KEY,
+    value FLOAT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO cluster_config (key, value)
+VALUES
+    ('similarity_threshold', 0.7),
+    ('similarity_percentile', 0.6),
+    ('similarity_sample_size', 200),
+    ('similarity_max_age_hours', 24)
+ON CONFLICT (key) DO UPDATE
+SET value = EXCLUDED.value,
+    updated_at = EXCLUDED.updated_at;
 
 -- ============================================================================
 -- AGENT CONFIG (Bootstrap Gate)
