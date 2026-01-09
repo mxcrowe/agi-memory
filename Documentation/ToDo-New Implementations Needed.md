@@ -77,5 +77,43 @@ NV-Embed-v2 (NVIDIA)
 4096-dimensional vectors, top performer on MTEB.
 Based on Mistral-7B, uses advanced latent attention pooling.
 English-only, but non-commercial (cc-by-nc-4.0) license.
-Requires significant GPU memory—ideal for your RTX 5070 if used non-commercially.
+Requires significant GPU memory-ideal for your RTX 5070 if used non-commercially.
+
+### Separate Hexis DBs for Code-Focused vs General Memory
+
+Motivation: Keep Claude Code sessions tightly focused on development context by isolating a code-centric memory DB from general-purpose Hexis memories. This reduces noise, improves recall relevance, and makes system behavior more predictable for engineering work.
+
+Pathway:
+- Create a second database (e.g., `agi_code_db`) on the same Postgres instance, initialized with `schema.sql`.
+- Use a dedicated DSN/env config for Claude Code (e.g., `POSTGRES_DB=agi_code_db` or an explicit DSN in the wrapper).
+- Keep the general Hexis system on the current DB, and switch at runtime by selecting the desired DSN.
+- (Optional) Use separate Docker volumes/containers for stronger isolation if needed later.
+
+Implementation Notes:
+- DB init: either `createdb agi_code_db` + run `schema.sql` manually, or spin a second Postgres container with its own volume so init scripts run automatically.
+- Embeddings: both DBs can share the same `embeddings` container; only embeddings cache is shared.
+- MCP/tooling: Claude Code wrapper should accept an explicit DSN to avoid accidental cross-use.
+- Backups: separate dump files per DB; avoid mixing volumes.
+
+### Future Rename: AGI → Hexis (Phase V Cutover)
+
+Motivation: Align naming with current project identity and upstream changes; reduce conceptual mismatch between the running system and its public-facing terminology.
+
+Pathway (defer until Phase V reset):
+- Do not rename during Phase IV; wait until DB retirement.
+- Prepare a staged rename plan (CLI commands, docker-compose services, docs).
+- Maintain backward-compatible shims where needed (`agi` → `hexis`).
+- Consider adopting upstream structure changes (core/apps split) only after stabilizing the rename.
+
+Notes:
+- The rename touches CLI commands (`agi init` → `hexis init`), service/container names, and docs.
+- A dry run in a cloned repo is recommended before touching the live system.
+
+### Fix: Reflect Loop Duplicating Worldview/Identity Entries
+
+Observation: `reflect` is repeatedly inserting the same worldview/identity items (e.g., "Honesty is important") each heartbeat, leading to duplicates.
+
+Likely cause: `process_reflection_result` lacks dedupe/upsert logic for `worldview_new` and identity updates.
+
+Action: add dedupe (match on belief/category) or update existing rows instead of inserting duplicates.
 
