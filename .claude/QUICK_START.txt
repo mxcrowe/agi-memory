@@ -1,0 +1,103 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                  HEXIS FOR CLAUDE CODE - QUICK START                       ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+WHAT IS THIS?
+─────────────
+Persistent project memory that follows you across Claude Code sessions.
+Any Claude Code instance in this worktree can query project context and
+log discoveries so future instances benefit.
+
+
+GET STARTED IN 30 SECONDS
+─────────────────────────
+
+1. In any Claude Code session, run:
+
+   from hexis_code_api import HexisAPI
+
+   async with HexisAPI() as api:
+       context = await api.hydrate("What should I work on?")
+       print(context)
+
+2. At end of session, log what you learned:
+
+   await api.remember(MemoryInput(
+       content="Accomplished: [what you did]",
+       memory_type=MemoryType.EPISODIC,
+       importance=0.8
+   ))
+
+
+AVAILABLE COMMANDS
+──────────────────
+  /hexis-hydrate   Get project context for a question
+  /hexis-log       Store your discovery for future instances
+
+
+KEY FILES
+─────────
+  hexis_code_api.py           Main API (ready to use!)
+  README.md                   Start here
+  HEXIS_CODE_SETUP.md         Full guide
+  DEPLOYMENT_GUIDE.md         How to set it all up
+  resources/hexis-context.md  Quick reference
+  commands/                   Slash commands
+
+
+BEFORE YOUR FIRST SESSION
+──────────────────────────
+(Do these once)
+
+1. Start Docker:
+   docker-compose up -d
+
+2. Initialize database:
+   python -m agi_cli init
+
+3. From Chat side, seed initial knowledge:
+   "Koan, remember for Claude Code: [project architecture/goals]"
+
+4. Done! Future Claude Code instances will have context.
+
+
+COMMON TASKS
+────────────
+
+Get context:
+  /hexis-hydrate "What architectural decisions have we made?"
+
+Log a fix:
+  /hexis-log "Fixed race condition by using asyncio.Lock"
+
+Check health:
+  python -c "
+  import asyncio
+  from hexis_code_api import HexisAPI
+
+  async def check():
+      async with HexisAPI() as api:
+          health = await api.get_health()
+          print(health)
+
+  asyncio.run(check())
+  "
+
+
+TROUBLESHOOTING
+───────────────
+Can't connect?        → docker-compose ps
+Missing asyncpg?      → pip install asyncpg
+Slow first search?    → Normal, generating embeddings
+No memories?          → Seed via Chat side or manually
+
+
+LEARN MORE
+──────────
+Full guide:     HEXIS_CODE_SETUP.md
+Quick ref:      resources/hexis-context.md
+Deployment:     DEPLOYMENT_GUIDE.md
+
+
+STATUS: ✅ READY TO USE
+Last Updated: 2026-01-08
