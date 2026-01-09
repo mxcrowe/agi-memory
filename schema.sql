@@ -521,6 +521,8 @@ CREATE INDEX idx_memory_concepts_concept ON memory_concepts (concept_id);
 CREATE INDEX idx_worldview_influences_memory ON worldview_memory_influences (memory_id, strength DESC);
 CREATE INDEX idx_identity_resonance_memory ON identity_memory_resonance (memory_id, resonance_strength DESC);
 CREATE INDEX idx_identity_aspects_type ON identity_aspects (aspect_type);
+CREATE UNIQUE INDEX idx_worldview_primitives_unique ON worldview_primitives (category, belief);
+CREATE UNIQUE INDEX idx_identity_aspects_unique ON identity_aspects (aspect_type, (content->>'change'));
 
 -- Cache indexes
 CREATE INDEX idx_embedding_cache_created ON embedding_cache (created_at);
@@ -3046,22 +3048,29 @@ CREATE OR REPLACE FUNCTION should_run_heartbeat()
 RETURNS BOOLEAN AS $$
 DECLARE
     state_record RECORD;
+    interval_minutes FLOAT;
 BEGIN
     -- Don't run until initial configuration is complete.
     IF NOT is_agent_configured() THEN
         RETURN FALSE;
     END IF;
+
     SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
+
     -- Don't run if paused
     IF state_record.is_paused THEN
         RETURN FALSE;
     END IF;
-    -- First heartbeat ever (next_heartbeat_at not set yet)
-    IF state_record.next_heartbeat_at IS NULL THEN
+
+    -- First heartbeat ever
+    IF state_record.last_heartbeat_at IS NULL THEN
         RETURN TRUE;
     END IF;
-    -- Use the scheduled next_heartbeat_at directly (single source of truth)
-    RETURN CURRENT_TIMESTAMP >= state_record.next_heartbeat_at;
+
+    -- Check interval - always recalculate from config (respects changes immediately)
+    SELECT value INTO interval_minutes FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes';
+
+    RETURN CURRENT_TIMESTAMP >= state_record.last_heartbeat_at + (interval_minutes || ' minutes')::INTERVAL;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -4731,10 +4740,11 @@ CREATE OR REPLACE FUNCTION process_reflection_result(
     p_result JSONB
 )
 RETURNS VOID AS $$
-	DECLARE
+DECLARE
     insight JSONB;
     ident JSONB;
     wupd JSONB;
+    wnew JSONB;
     rel JSONB;
     contra JSONB;
     selfupd JSONB;
@@ -4796,7 +4806,8 @@ BEGIN
                     aspect_type,
                     jsonb_build_object('change', change_text, 'reason', reason_text, 'heartbeat_id', p_heartbeat_id),
                     0.5
-                );
+                )
+                ON CONFLICT DO NOTHING;
             END IF;
         END LOOP;
     END IF;
@@ -4814,6 +4825,23 @@ BEGIN
             END IF;
 	        END LOOP;
 	    END IF;
+
+        IF p_result ? 'worldview_new' THEN
+            FOR wnew IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'worldview_new', '[]'::jsonb))
+            LOOP
+                category := COALESCE(wnew->>'category', '');
+                content := COALESCE(wnew->>'belief', '');
+                new_conf := COALESCE((wnew->>'confidence')::float, 0.7);
+
+                IF category <> '' AND content <> '' THEN
+                    INSERT INTO worldview_primitives (category, belief, confidence, updated_at)
+                    VALUES (category, content, new_conf, CURRENT_TIMESTAMP)
+                    ON CONFLICT (category, belief) DO UPDATE
+                    SET confidence = GREATEST(worldview_primitives.confidence, EXCLUDED.confidence),
+                        updated_at = CURRENT_TIMESTAMP;
+                END IF;
+            END LOOP;
+        END IF;
 
 	    -- Optional worldview evidence links: insert influences so trust/alignment can be computed and beliefs can update over time.
 	    IF p_result ? 'worldview_influences' THEN
